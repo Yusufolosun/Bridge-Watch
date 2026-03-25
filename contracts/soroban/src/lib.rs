@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod governance;
+
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Vec};
 
 #[contracttype]
