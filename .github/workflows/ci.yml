@@ -58,6 +58,45 @@ jobs:
         working-directory: backend
         run: npm run build
 
+      - name: Validate migration files
+        working-directory: backend
+        run: npm run migrate:validate
+        env:
+          NODE_ENV: test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: bridge_watch_test
+          POSTGRES_USER: bridge_watch
+          POSTGRES_PASSWORD: test_password
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
+      - name: Run pending migrations
+        working-directory: backend
+        run: npm run migrate
+        env:
+          NODE_ENV: test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: bridge_watch_test
+          POSTGRES_USER: bridge_watch
+          POSTGRES_PASSWORD: test_password
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
+      - name: Verify migration status
+        working-directory: backend
+        run: npm run migrate:status
+        env:
+          NODE_ENV: test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: bridge_watch_test
+          POSTGRES_USER: bridge_watch
+          POSTGRES_PASSWORD: test_password
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
       - name: Run backend tests
         working-directory: backend
         run: npm run test -- --coverage
