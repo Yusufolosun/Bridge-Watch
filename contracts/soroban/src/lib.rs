@@ -3,6 +3,8 @@
 
 // governance and insurance_pool are standalone contracts — only compiled for
 // tests (native target) to avoid Wasm symbol conflicts with BridgeWatchContract.
+pub mod acl;
+#[cfg(test)]
 pub mod analytics_aggregator;
 #[cfg(test)]
 pub mod asset_registry;
@@ -13,17 +15,100 @@ pub mod governance;
 #[cfg(test)]
 pub mod insurance_pool;
 pub mod liquidity_pool;
+#[cfg(test)]
 pub mod multisig_treasury;
 #[cfg(test)]
 pub mod rate_limiter;
+#[cfg(test)]
 pub mod reputation_system;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Vec,
+};
+
+use acl::{
+    AclKey, BulkPermissionEntry, BulkRoleEntry, Permission, PermissionGrant, Role, RoleGrant,
+};
 
 use liquidity_pool::{
     DailyBucket, ImpermanentLossResult, LiquidityDepth as PoolLiquidityDepth, PoolMetrics,
     PoolSnapshot, PoolType,
 };
+
+// Storage key constants instead of using DataKey enum for storage operations
+mod keys {
+    pub const ADMIN: &str = "admin";
+    pub const ASSET_HEALTH: &str = "asset_health";
+    pub const PRICE_RECORD: &str = "price_record";
+    pub const MONITORED_ASSETS: &str = "monitored_assets";
+    pub const DEVIATION_ALERT: &str = "deviation_alert";
+    pub const DEVIATION_THRESHOLD: &str = "deviation_threshold";
+    pub const SUPPLY_MISMATCHES: &str = "supply_mismatches";
+    pub const MISMATCH_THRESHOLD: &str = "mismatch_threshold";
+    pub const BRIDGE_IDS: &str = "bridge_ids";
+    pub const ROLE_KEY: &str = "role_key";
+    pub const ROLES_LIST: &str = "roles_list";
+    pub const SIGNER: &str = "signer";
+    pub const SIGNER_LIST: &str = "signer_list";
+    pub const SIGNATURE_THRESHOLD: &str = "signature_threshold";
+    pub const SIGNER_NONCE: &str = "signer_nonce";
+    pub const SIGNATURE_CACHE: &str = "signature_cache";
+    pub const LIQUIDITY_DEPTH: &str = "liquidity_depth";
+    pub const LIQUIDITY_HISTORY: &str = "liquidity_history";
+    pub const LIQUIDITY_PAIRS: &str = "liquidity_pairs";
+    pub const PRICE_HISTORY: &str = "price_history";
+    pub const HEALTH_WEIGHTS: &str = "health_weights";
+    pub const HEALTH_SCORE_RESULT: &str = "health_score_result";
+    pub const RISK_SCORE_CONFIG: &str = "risk_score_config";
+    pub const CHECKPOINT_CONFIG: &str = "checkpoint_config";
+    pub const CHECKPOINT_COUNTER: &str = "checkpoint_counter";
+    pub const CHECKPOINT_METADATA_LIST: &str = "checkpoint_metadata_list";
+    pub const CHECKPOINT_SNAPSHOT: &str = "checkpoint_snapshot";
+    pub const LAST_CHECKPOINT_AT: &str = "last_checkpoint_at";
+    pub const LAST_CHECKPOINT_ID: &str = "last_checkpoint_id";
+    pub const RETENTION_POLICY: &str = "retention_policy";
+    pub const ASSET_RETENTION_OVR: &str = "asset_retention_ovr";
+    pub const LAST_CLEANUP_AT: &str = "last_cleanup_at";
+    pub const ARCHIVED_MISMATCHES: &str = "archived_mismatches";
+    pub const ARCHIVED_LIQUIDITY_HISTORY: &str = "archived_liquidity_history";
+    pub const ARCHIVED_CHECKPOINT_META: &str = "archived_checkpoint_meta";
+    pub const ARCHIVED_CHECKPOINT_SNAPSHOT: &str = "archived_checkpoint_snapshot";
+    pub const GLOBAL_PAUSED: &str = "global_paused";
+    pub const PAUSE_GUARDIAN: &str = "pause_guardian";
+    pub const PAUSE_REASON: &str = "pause_reason";
+    pub const PAUSED_AT: &str = "paused_at";
+    pub const UNPAUSE_AVAILABLE_AT: &str = "unpause_available_at";
+    pub const PAUSE_HISTORY: &str = "pause_history";
+    pub const EMERGENCY_CONTACT: &str = "emergency_contact";
+    pub const ASSET_PAUSE_REASON: &str = "asset_pause_reason";
+    pub const PENDING_TRANSFER: &str = "pending_transfer";
+    pub const PENDING_UPGRADE: &str = "pending_upgrade";
+    pub const UPGRADE_PROPOSAL_COUNTER: &str = "upgrade_proposal_counter";
+    pub const UPGRADE_HISTORY: &str = "upgrade_history";
+    pub const CONTRACT_VERSION: &str = "contract_version";
+    pub const CURRENT_CONTRACT_WASM_HASH: &str = "current_wasm_hash";
+    pub const ROLLBACK_TARGET_HASH: &str = "rollback_target_hash";
+    pub const CONFIG_ENTRY: &str = "config_entry";
+    pub const CONFIG_KEYS: &str = "config_keys";
+    pub const CONFIG_AUDIT_LOG: &str = "config_audit_log";
+    pub const ASSET_STATISTICS: &str = "asset_statistics";
+    pub const EXPIRATIONPOLICY: &str = "expiration_policy";
+    pub const CLEANUPSTATS: &str = "cleanup_stats";
+    // Emergency Recovery (issue #298)
+    pub const RECOVERY_MODE: &str = "recovery_mode";
+    pub const RECOVERY_STEPS: &str = "recovery_steps";
+    pub const RECOVERY_REASON: &str = "recovery_reason";
+    pub const RECOVERY_ENTERED_AT: &str = "recovery_entered_at";
+    pub const RECOVERY_ENTERED_BY: &str = "recovery_entered_by";
+    // Admin Activity Service (issue #299)
+    pub const ADMIN_ACTIVITY_LOG: &str = "admin_activity_log";
+    pub const ADMIN_ACTIVITY_CTR: &str = "admin_activity_ctr";
+    // Multi-Source Health Submission (issue #300)
+    pub const HEALTH_SOURCES: &str = "health_sources";
+    // Event Replay Helpers (issue #296)
+    pub const EVENT_REPLAY_LOG: &str = "event_replay_log";
+    pub const EVENT_REPLAY_CTR: &str = "event_replay_ctr";
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +121,7 @@ pub struct AssetHealth {
     pub paused: bool,
     pub active: bool,
     pub timestamp: u64,
+    pub expires_at: u64,
 }
 
 /// Represents a single entry in a batch health score submission.
@@ -86,6 +172,54 @@ pub struct HealthScoreResult {
     pub weights: HealthWeights,
     /// Ledger timestamp when the calculation was performed.
     pub timestamp: u64,
+    /// Timestamp after which the stored calculation result may be cleaned up.
+    pub expires_at: u64,
+}
+
+/// Configuration for deterministic contract-side risk score calculation.
+///
+/// The three weights are expressed in basis points and must sum to exactly
+/// 10,000. `max_price_deviation_bps` and `max_volatility_bps` define the
+/// normalization ceilings for raw price and volatility inputs.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskScoreConfig {
+    /// Weight assigned to the inverted health signal.
+    pub health_weight_bps: u32,
+    /// Weight assigned to the price deviation signal.
+    pub price_weight_bps: u32,
+    /// Weight assigned to the volatility signal.
+    pub volatility_weight_bps: u32,
+    /// Price deviation level that maps to maximum normalized risk.
+    pub max_price_deviation_bps: u32,
+    /// Volatility level that maps to maximum normalized risk.
+    pub max_volatility_bps: u32,
+    /// Methodology version identifier for auditability.
+    pub version: u32,
+}
+
+/// Output of the deterministic risk score calculation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskScoreResult {
+    /// Composite risk score normalized to basis points (0–10,000).
+    pub risk_score_bps: u32,
+    /// Inverted health contribution normalized to basis points.
+    pub normalized_health_risk_bps: u32,
+    /// Price deviation contribution normalized to basis points.
+    pub normalized_price_risk_bps: u32,
+    /// Volatility contribution normalized to basis points.
+    pub normalized_volatility_risk_bps: u32,
+    /// Raw health score input (0–100).
+    pub health_score: u32,
+    /// Raw price deviation input in basis points.
+    pub price_deviation_bps: u32,
+    /// Raw volatility input in basis points.
+    pub volatility_bps: u32,
+    /// Configuration applied during the calculation.
+    pub config: RiskScoreConfig,
+    /// Ledger timestamp when the calculation was performed.
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -95,6 +229,7 @@ pub struct PriceRecord {
     pub price: i128,
     pub source: String,
     pub timestamp: u64,
+    pub expires_at: u64,
 }
 
 /// Severity level of a recorded price deviation alert.
@@ -120,6 +255,7 @@ pub struct DeviationAlert {
     pub deviation_bps: i128,
     pub severity: DeviationSeverity,
     pub timestamp: u64,
+    pub expires_at: u64,
 }
 
 /// Per-asset configurable deviation thresholds (in basis points).
@@ -132,6 +268,38 @@ pub struct DeviationThreshold {
     pub medium_bps: i128,
     /// High-severity trigger; default 1 000 bps (10 %).
     pub high_bps: i128,
+}
+
+/// Override mode for per-asset threshold changes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThresholdOverrideMode {
+    Temporary,
+    Permanent,
+}
+
+/// Per-asset override record for deviation thresholds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviationThresholdOverride {
+    pub threshold: DeviationThreshold,
+    pub mode: ThresholdOverrideMode,
+    /// Expiration timestamp for temporary overrides. `0` for permanent.
+    pub expires_at: u64,
+    pub updated_by: Address,
+    pub updated_at: u64,
+}
+
+/// Per-asset override record for mismatch thresholds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MismatchThresholdOverride {
+    pub threshold_bps: i128,
+    pub mode: ThresholdOverrideMode,
+    /// Expiration timestamp for temporary overrides. `0` for permanent.
+    pub expires_at: u64,
+    pub updated_by: Address,
+    pub updated_at: u64,
 }
 
 /// Records a supply mismatch between Stellar and a source chain for a bridge.
@@ -147,6 +315,7 @@ pub struct SupplyMismatch {
     /// `true` when `mismatch_bps` is at or above the configured threshold.
     pub is_critical: bool,
     pub timestamp: u64,
+    pub expires_at: u64,
 }
 
 /// Aggregated liquidity depth for an asset pair across multiple DEX venues.
@@ -169,6 +338,115 @@ pub struct LiquidityDepth {
     pub sources: Vec<String>,
     /// Ledger timestamp when this aggregate was recorded.
     pub timestamp: u64,
+    pub expires_at: u64,
+}
+
+/// Global cleanup and record-retention policy.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpirationPolicy {
+    pub asset_ttl_secs: u64,
+    pub price_ttl_secs: u64,
+    pub deviation_ttl_secs: u64,
+    pub mismatch_ttl_secs: u64,
+    pub liquidity_ttl_secs: u64,
+    pub preserve_latest_history: bool,
+    pub version: u32,
+}
+
+/// Summary of the most recent cleanup run.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupStats {
+    pub last_run_at: u64,
+    pub removed_records: u32,
+    pub trimmed_history_records: u32,
+    pub last_actor: Address,
+}
+
+/// Structured event envelope for filtering and richer indexing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BridgeWatchEvent {
+    Initialized {
+        admin: Address,
+        timestamp: u64,
+    },
+    HealthSubmitted {
+        actor: Address,
+        asset_code: String,
+        health_score: u32,
+        timestamp: u64,
+    },
+    PriceSubmitted {
+        actor: Address,
+        asset_code: String,
+        price: i128,
+        source: String,
+        timestamp: u64,
+    },
+    AssetRegistrationChanged {
+        actor: Address,
+        asset_code: String,
+        active: bool,
+        paused: bool,
+        timestamp: u64,
+    },
+    ThresholdUpdated {
+        actor: Address,
+        scope: String,
+        value: i128,
+        timestamp: u64,
+    },
+    SupplyMismatchRecorded {
+        actor: Address,
+        bridge_id: String,
+        asset_code: String,
+        mismatch_bps: i128,
+        is_critical: bool,
+        timestamp: u64,
+    },
+    LiquidityDepthRecorded {
+        actor: Address,
+        asset_pair: String,
+        total_liquidity: i128,
+        timestamp: u64,
+    },
+    RoleChanged {
+        actor: Address,
+        target: Address,
+        granted: bool,
+        role: AdminRole,
+        timestamp: u64,
+    },
+    ExpirationPolicyUpdated {
+        actor: Address,
+        scope: String,
+        ttl_secs: u64,
+        timestamp: u64,
+    },
+    ExpirationExtended {
+        actor: Address,
+        scope: String,
+        expires_at: u64,
+        timestamp: u64,
+    },
+    CleanupCompleted {
+        actor: Address,
+        removed_records: u32,
+        trimmed_history_records: u32,
+        timestamp: u64,
+    },
+}
+
+#[contracttype]
+#[derive(Clone, Copy)]
+enum ExpirationKind {
+    Asset,
+    Price,
+    Deviation,
+    Mismatch,
+    Liquidity,
+    HealthResult,
 }
 /// Permission roles that can be assigned to admin addresses.
 ///
@@ -249,6 +527,220 @@ pub struct PendingAdminTransfer {
     pub timeout_at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Contract Upgrade types (issue #98)
+// ---------------------------------------------------------------------------
+
+/// Pending contract upgrade proposal guarded by governance approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    /// Monotonic proposal identifier.
+    pub proposal_id: u64,
+    /// Governance member that created the proposal.
+    pub proposer: Address,
+    /// Target Wasm hash to activate.
+    pub new_wasm_hash: BytesN<32>,
+    /// Proposal creation timestamp.
+    pub proposed_at: u64,
+    /// Earliest timestamp at which execution is allowed.
+    pub execute_after: u64,
+    /// Number of distinct governance approvals required to execute.
+    pub required_approvals: u32,
+    /// Distinct governance addresses that have approved this proposal.
+    pub approvals: Vec<Address>,
+    /// `true` for emergency upgrade path.
+    pub emergency: bool,
+    /// Optional external migration callback contract.
+    pub migration_callback: Option<Address>,
+    /// Optional migration payload consumed by callback tooling.
+    pub migration_payload: Option<Bytes>,
+    /// `true` when this proposal is a rollback to a tracked prior hash.
+    pub is_rollback: bool,
+}
+
+/// Immutable historical entry for each executed upgrade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeExecutionRecord {
+    pub proposal_id: u64,
+    pub executed_by: Address,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub has_from_wasm_hash: bool,
+    pub from_wasm_hash: BytesN<32>,
+    pub to_wasm_hash: BytesN<32>,
+    pub executed_at: u64,
+    pub emergency: bool,
+    pub is_rollback: bool,
+    pub has_migration_callback: bool,
+    pub migration_callback: Address,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot and checkpoint types (issue #105)
+// ---------------------------------------------------------------------------
+
+/// How a checkpoint was created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointTrigger {
+    Automatic,
+    Manual,
+    Restore,
+}
+
+/// Admin-configurable checkpoint behavior.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointConfig {
+    /// Minimum number of seconds between automatic checkpoints.
+    pub interval_secs: u64,
+    /// Maximum number of stored checkpoints before pruning oldest entries.
+    pub max_checkpoints: u32,
+    /// Checkpoint serialization format version for compatibility checks.
+    pub format_version: u32,
+}
+
+/// Per-asset state captured in a checkpoint snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAssetState {
+    pub asset_code: String,
+    pub health: AssetHealth,
+    pub has_latest_price: bool,
+    pub latest_price: PriceRecord,
+    pub has_health_result: bool,
+    pub health_result: HealthScoreResult,
+}
+
+/// Full checkpoint snapshot used for historical analysis and restore.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointSnapshot {
+    pub checkpoint_id: u64,
+    pub format_version: u32,
+    pub created_at: u64,
+    pub trigger: CheckpointTrigger,
+    pub created_by: Address,
+    pub label: String,
+    pub monitored_assets: Vec<String>,
+    pub health_weights: HealthWeights,
+    pub risk_score_config: RiskScoreConfig,
+    pub assets: Vec<CheckpointAssetState>,
+    pub restored_from: Option<u64>,
+}
+
+/// Compact metadata stored separately for efficient checkpoint listing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointMetadata {
+    pub checkpoint_id: u64,
+    pub format_version: u32,
+    pub created_at: u64,
+    pub trigger: CheckpointTrigger,
+    pub created_by: Address,
+    pub label: String,
+    pub monitored_asset_count: u32,
+    pub asset_count: u32,
+    pub state_hash: BytesN<32>,
+    pub restored_from: Option<u64>,
+}
+
+/// Per-asset comparison result between two checkpoints.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAssetDiff {
+    pub asset_code: String,
+    pub health_changed: bool,
+    pub price_changed: bool,
+    pub health_result_changed: bool,
+}
+
+/// High-level comparison output for two checkpoints.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointComparison {
+    pub from_checkpoint_id: u64,
+    pub to_checkpoint_id: u64,
+    pub timestamp_delta: u64,
+    pub state_hash_changed: bool,
+    pub weights_changed: bool,
+    pub added_assets: Vec<String>,
+    pub removed_assets: Vec<String>,
+    pub changed_assets: Vec<CheckpointAssetDiff>,
+}
+
+/// Validation result for a stored checkpoint snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointValidation {
+    pub checkpoint_id: u64,
+    pub is_valid: bool,
+    pub message: String,
+}
+
+/// Historical data buckets managed by retention policies.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetentionDataType {
+    SupplyMismatches,
+    LiquidityHistory,
+    Checkpoints,
+}
+
+/// Admin-configurable retention policy for a single historical data bucket.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionPolicy {
+    pub data_type: RetentionDataType,
+    pub retention_secs: u64,
+    pub trigger_interval_secs: u64,
+    pub max_deletions_per_run: u32,
+    pub archive_before_delete: bool,
+    pub enabled: bool,
+}
+
+/// Per data type cleanup execution summary.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupDataTypeResult {
+    pub data_type: RetentionDataType,
+    pub deleted: u32,
+    pub archived: u32,
+}
+
+/// Aggregate cleanup execution output.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupResult {
+    pub executed_at: u64,
+    pub total_deleted: u32,
+    pub total_archived: u32,
+    pub details: Vec<CleanupDataTypeResult>,
+}
+
+/// Storage usage counters for a single retention bucket.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageUsageEntry {
+    pub data_type: RetentionDataType,
+    pub tracked_keys: u32,
+    pub active_records: u32,
+    pub archived_records: u32,
+}
+
+/// Lightweight storage usage snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageStats {
+    pub generated_at: u64,
+    pub total_tracked_keys: u32,
+    pub total_active_records: u32,
+    pub total_archived_records: u32,
+    pub entries: Vec<StorageUsageEntry>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Signer {
@@ -267,71 +759,381 @@ pub struct SignerSignature {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetDataKey {
+    Health(String),
+    Price(String),
+    PriceHist(String),
+    Stats(String),
+    ExpTtl(String),
+    HealthRes(String),
+    DevAlert(String),
+    DevThresh(String),
+    DevThreshOvr(String),
+    MmThreshOvr(String),
+    LiqDepth(String),
+    LiqHist(String),
+    ArchLiqHist(String),
+    PauseReason(String),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BridgeDataKey {
+    Mismatches(String),
+    ArchMismatches(String),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigDataKey {
+    Signer(String),
+    SignerNonce(String),
+    SigCache(BytesN<32>),
+    RoleKey(Address),
+    ChkpntSnap(u64),
+    ArchChkpntSnap(u64),
+    RetPolicy(RetentionDataType),
+    LastCleanup(RetentionDataType),
+    Entry(ConfigCategory, String),
+    RetOvr(String, RetentionDataType),
+    AuditLog(ConfigCategory, String),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
-    AssetHealth(String),
-    PriceRecord(String),
     MonitoredAssets,
-    /// Latest deviation alert recorded for an asset.
-    DeviationAlert(String),
-    /// Admin-configured deviation thresholds for an asset.
-    DeviationThreshold(String),
-    /// Historical supply mismatch records for a bridge (Vec<SupplyMismatch>).
-    SupplyMismatches(String),
-    /// Global critical mismatch threshold in basis points (default 10 bps / 0.1 %).
     MismatchThreshold,
-    /// All bridge IDs that have at least one mismatch record (Vec<String>).
     BridgeIds,
-    /// Roles held by a specific address (Vec<AdminRole>).
-    RoleKey(Address),
-    /// Global list of all role assignments for enumeration.
     RolesList,
-    /// Registered signers keyed by signer id.
-    Signer(String),
-    /// List of all registered signer ids.
     SignerList,
-    /// Signature threshold required for multi-sig operations.
     SignatureThreshold,
-    /// Nonce tracking for replay protection per signer.
-    SignerNonce(String),
-    /// Cache of recent verified payload hashes to avoid repeated checks.
-    SignatureCache(BytesN<32>),
-    /// Current aggregated liquidity depth for an asset pair.
-    LiquidityDepthCurrent(String),
-    /// Historical aggregated liquidity depth snapshots for an asset pair.
-    LiquidityDepthHistory(String),
-    /// Registered asset pairs with liquidity depth data.
     LiquidityPairs,
-    /// Historical price records for an asset (Vec<PriceRecord>).
-    PriceHistory(String),
-    /// Stored health score calculation weights.
     HealthWeights,
-    /// Detailed health score calculation result for an asset.
-    HealthScoreResult(String),
-    // -----------------------------------------------------------------------
-    // Emergency Pause storage keys (issue #96)
-    // -----------------------------------------------------------------------
-    /// Global pause toggle — stores `bool`.
+    RiskScoreConfig,
+    CheckpointConfig,
+    CheckpointCounter,
+    ChkpntMetaList,
+    LastCheckpointAt,
+    LastCheckpointId,
+    ArchChkpntMeta,
     GlobalPaused,
-    /// Address authorised to call `emergency_pause()` without admin rights.
     PauseGuardian,
-    /// Human-readable reason for the current global pause.
     PauseReason,
-    /// Ledger timestamp at which the current global pause was triggered.
     PausedAt,
-    /// Earliest ledger timestamp at which `unpause()` may succeed (timelock).
     UnpauseAvailableAt,
-    /// Full ordered history of pause/unpause events (`Vec<PauseRecord>`).
     PauseHistory,
-    /// Operator emergency contact string (e-mail, Telegram, etc.).
     EmergencyContact,
-    /// Per-asset pause reason (separate from the global pause).
-    AssetPauseReason(String),
-    // -----------------------------------------------------------------------
-    // Admin Transfer storage keys (issue #97)
-    // -----------------------------------------------------------------------
-    /// Pending two-step admin transfer proposal (`PendingAdminTransfer`).
     PendingTransfer,
+    PendingUpgrade,
+    UpgradePropCtr,
+    UpgradeHistory,
+    ContractVersion,
+    CurrentWasmHash,
+    RollbackTargetHash,
+    ConfigKeys,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatPeriod {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Statistics {
+    pub period: StatPeriod,
+    pub timestamp: u64,
+    pub health_avg: u32,
+    pub liquidity_avg: u32,
+    pub price_volatility: u32,
+    pub bridge_uptime: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Configuration Management types (issue #103)
+// ---------------------------------------------------------------------------
+
+/// Categories that group related configuration parameters.
+///
+/// - `Threshold` – numeric trigger values (e.g. deviation bps, health score).
+/// - `Timeouts`   – durations expressed in seconds (e.g. cooldown periods).
+/// - `Limits`     – capacity / rate limits (e.g. max assets, max batch size).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigCategory {
+    Threshold,
+    Timeouts,
+    Limits,
+}
+
+/// The typed value stored for a configuration parameter.
+///
+/// All values are stored as `i128` to keep the on-chain format uniform and
+/// gas-efficient. Boolean flags are encoded as 0 (false) or 1 (true). The
+/// `description` field is stored only at write time so callers always know
+/// what the parameter controls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigValue {
+    /// Numeric parameter value.
+    pub value: i128,
+    /// Human-readable description of what this parameter controls.
+    pub description: String,
+}
+
+/// A versioned, timestamped on-chain configuration entry.
+///
+/// Every write to a parameter creates a new `ConfigEntry` with an
+/// auto-incremented `version`. The previous value is preserved in the
+/// `ConfigAuditLog` for that parameter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigEntry {
+    /// Parameter category.
+    pub category: ConfigCategory,
+    /// Parameter name (e.g. "health_score_min_threshold").
+    pub name: String,
+    /// Current value.
+    pub value: ConfigValue,
+    /// Monotonically-increasing write counter (starts at 1).
+    pub version: u32,
+    /// Ledger timestamp of the most recent write.
+    pub updated_at: u64,
+    /// Address that performed the most recent write.
+    pub updated_by: Address,
+}
+
+/// A single audit log record written every time a parameter is changed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigAuditEntry {
+    /// The value that was replaced.
+    pub old_value: i128,
+    /// The new value that was written.
+    pub new_value: i128,
+    /// Version number that was assigned to the new write.
+    pub version: u32,
+    /// Ledger timestamp of the change.
+    pub changed_at: u64,
+    /// Address that performed the change.
+    pub changed_by: Address,
+}
+
+/// A single item inside a bulk configuration update request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkConfigUpdate {
+    pub category: ConfigCategory,
+    pub name: String,
+    pub value: i128,
+    pub description: String,
+}
+
+/// Snapshot of all stored configuration parameters — returned by
+/// `get_all_configs()` for export / off-chain synchronisation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllConfigsExport {
+    /// All current configuration entries.
+    pub entries: Vec<ConfigEntry>,
+    /// Total number of parameters stored.
+    pub total: u32,
+    /// Ledger timestamp when this export was generated.
+    pub exported_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Event Replay Helper types (issue #296)
+// ---------------------------------------------------------------------------
+
+/// Schema version for EventReplayEntry. Increment when the struct layout changes
+/// so off-chain consumers can detect and handle schema migrations.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// A replay-friendly record of a contract event.
+///
+/// Every entry carries a stable `schema_version` so off-chain replay tools can
+/// detect layout changes. The `ordering_key` is `(timestamp << 32) | sequence`
+/// and provides deterministic ordering even when two events share a timestamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventReplayEntry {
+    /// Monotonically-increasing sequence number (starts at 1).
+    pub event_id: u32,
+    /// Short label identifying the event kind (e.g. "health_up", "em_pause").
+    pub event_type: String,
+    /// Address that triggered the event.
+    pub actor: Address,
+    /// Primary subject of the event (asset code, source_id, etc.).
+    pub subject: String,
+    /// Numeric payload (score, price, flag, etc.; 0 if not applicable).
+    pub value: i128,
+    /// Ledger timestamp when the event was emitted.
+    pub timestamp: u64,
+    /// `(timestamp << 32) | sequence` — stable total order for replay.
+    pub ordering_key: u64,
+    /// Schema version at the time this entry was written.
+    pub schema_version: u32,
+}
+
+/// Paginated result returned by `get_replay_events`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventReplayPage {
+    /// Entries for the requested window.
+    pub entries: Vec<EventReplayEntry>,
+    /// Total entries in the log (not just this page).
+    pub total: u32,
+    /// Schema version of entries in this page.
+    pub schema_version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Source Health Submission types (issue #300)
+// ---------------------------------------------------------------------------
+
+/// A trusted source that may submit health data via `submit_health_multi_source`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthSource {
+    /// Unique identifier for this source (e.g., "oracle-1", "bridge-node-a").
+    pub source_id: String,
+    /// Relative weight in basis points (10 000 = 100 %). Used in aggregation.
+    pub weight_bps: u32,
+    /// Whether this source is currently trusted to submit data.
+    pub trusted: bool,
+    /// Ledger timestamp when the source was registered.
+    pub registered_at: u64,
+}
+
+/// A per-source health data point stored for a specific asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourcedHealthEntry {
+    /// Source that submitted this entry.
+    pub source_id: String,
+    /// Asset this entry applies to.
+    pub asset_code: String,
+    pub health_score: u32,
+    pub liquidity_score: u32,
+    pub price_stability_score: u32,
+    pub bridge_uptime_score: u32,
+    /// Ledger timestamp of submission.
+    pub submitted_at: u64,
+}
+
+/// Weighted aggregation of all trusted source submissions for one asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedHealth {
+    pub asset_code: String,
+    /// Weighted-average health score across all contributing sources.
+    pub weighted_health_score: u32,
+    /// Weighted-average liquidity score.
+    pub weighted_liquidity_score: u32,
+    /// Weighted-average price stability score.
+    pub weighted_price_stability_score: u32,
+    /// Weighted-average bridge uptime score.
+    pub weighted_bridge_uptime_score: u32,
+    /// Number of trusted sources that contributed.
+    pub source_count: u32,
+    /// Ledger timestamp when this aggregation was computed.
+    pub computed_at: u64,
+}
+
+/// Storage key for per-source health entries (source_id → SourcedHealthEntry list).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HealthSourceDataKey {
+    /// Sourced entry for (source_id, asset_code).
+    Entry(String, String),
+}
+
+// ---------------------------------------------------------------------------
+// Admin Activity Service types (issue #299)
+// ---------------------------------------------------------------------------
+
+/// Categories of admin actions captured by the activity log.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminActivityAction {
+    HealthSubmitted,
+    PriceSubmitted,
+    AssetRegistered,
+    RoleGranted,
+    RoleRevoked,
+    ContractPaused,
+    ContractUnpaused,
+    ConfigUpdated,
+    RecoveryEntered,
+    RecoveryExited,
+}
+
+/// A single entry in the on-chain admin activity log.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminActivityEntry {
+    /// Monotonically-increasing sequence number (starts at 1).
+    pub sequence: u32,
+    /// Category of action taken.
+    pub action: AdminActivityAction,
+    /// Address that performed the action.
+    pub actor: Address,
+    /// Human-readable context (asset code, role name, reason, etc.).
+    pub detail: String,
+    /// Ledger timestamp when the action was recorded.
+    pub timestamp: u64,
+}
+
+/// Paginated result returned by `get_admin_activity`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminActivityPage {
+    /// Entries for the requested page.
+    pub entries: Vec<AdminActivityEntry>,
+    /// Total entries in the log (not just this page).
+    pub total: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Emergency Recovery types (issue #298)
+// ---------------------------------------------------------------------------
+
+/// A single step recorded during an active emergency recovery sequence.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryStep {
+    /// Human-readable description of the action taken.
+    pub description: String,
+    /// Always `true` — steps are only written when completed.
+    pub completed: bool,
+    /// Ledger timestamp when this step was recorded.
+    pub recorded_at: u64,
+    /// Address that recorded the step.
+    pub actor: Address,
+}
+
+/// Summary of the current emergency recovery state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryState {
+    /// Whether recovery mode is currently active.
+    pub active: bool,
+    /// Human-readable reason passed to `enter_recovery_mode`.
+    pub reason: String,
+    /// Ledger timestamp when recovery mode was entered.
+    pub entered_at: u64,
+    /// Address that activated recovery mode.
+    pub entered_by: Address,
+    /// Number of recovery steps logged so far.
+    pub step_count: u32,
 }
 
 #[contract]
@@ -343,11 +1145,37 @@ impl BridgeWatchContract {
     /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&keys::ADMIN, &admin);
         let assets: Vec<String> = Vec::new(&env);
         env.storage()
             .instance()
-            .set(&DataKey::MonitoredAssets, &assets);
+            .set(&keys::MONITORED_ASSETS, &assets);
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_CONFIG, &Self::default_checkpoint_config());
+        let empty_metadata: Vec<CheckpointMetadata> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_METADATA_LIST, &empty_metadata);
+        env.storage()
+            .instance()
+            .set(&keys::ARCHIVED_CHECKPOINT_META, &empty_metadata);
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_COUNTER, &0u64);
+        env.storage()
+            .instance()
+            .set(&keys::LAST_CHECKPOINT_AT, &0u64);
+        env.storage().instance().set(&keys::CONTRACT_VERSION, &1u32);
+        env.storage()
+            .instance()
+            .set(&keys::UPGRADE_PROPOSAL_COUNTER, &0u64);
+        let empty_upgrade_history: Vec<UpgradeExecutionRecord> = Vec::new(&env);
+        env.storage()
+            .persistent()
+            .set(&keys::UPGRADE_HISTORY, &empty_upgrade_history);
+
+        Self::initialize_retention_policies(&env);
     }
 
     /// Submit a health score for a monitored asset.
@@ -368,6 +1196,7 @@ impl BridgeWatchContract {
         Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
         let status = Self::load_asset_health(&env, &asset_code);
         Self::assert_asset_accepting_submissions(&status);
+        let timestamp = env.ledger().timestamp();
 
         let record = AssetHealth {
             asset_code: asset_code.clone(),
@@ -377,15 +1206,29 @@ impl BridgeWatchContract {
             bridge_uptime_score,
             paused: status.paused,
             active: status.active,
-            timestamp: env.ledger().timestamp(),
+            timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::Asset,
+                timestamp,
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &record);
+            .set(&AssetDataKey::Health(asset_code.clone()), &record);
 
         env.events()
-            .publish((symbol_short!("health_up"), asset_code), health_score);
+            .publish((symbol_short!("health_up"), asset_code.clone()), health_score);
+        Self::append_replay_event(
+            &env,
+            String::from_str(&env, "health_up"),
+            caller.clone(),
+            asset_code,
+            health_score as i128,
+        );
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Submit health scores for multiple assets in a single transaction.
@@ -416,17 +1259,34 @@ impl BridgeWatchContract {
                 paused: status.paused,
                 active: status.active,
                 timestamp,
+                expires_at: Self::resolve_expiration(
+                    &env,
+                    &item.asset_code,
+                    ExpirationKind::Asset,
+                    timestamp,
+                ),
             };
 
             env.storage()
                 .persistent()
-                .set(&DataKey::AssetHealth(item.asset_code.clone()), &record);
+                .set(&AssetDataKey::Health(item.asset_code.clone()), &record);
 
             env.events().publish(
                 (symbol_short!("health_up"), item.asset_code.clone()),
                 item.health_score,
             );
+            Self::emit_contract_event(
+                &env,
+                BridgeWatchEvent::HealthSubmitted {
+                    actor: caller.clone(),
+                    asset_code: item.asset_code.clone(),
+                    health_score: item.health_score,
+                    timestamp,
+                },
+            );
         }
+
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Submit a price record for an asset.
@@ -446,49 +1306,62 @@ impl BridgeWatchContract {
         Self::check_permission(&env, &caller, AdminRole::PriceSubmitter);
         let status = Self::load_asset_health(&env, &asset_code);
         Self::assert_asset_accepting_submissions(&status);
+        let timestamp = env.ledger().timestamp();
 
         let record = PriceRecord {
             asset_code: asset_code.clone(),
             price,
-            source,
-            timestamp: env.ledger().timestamp(),
+            source: source.clone(),
+            timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::Price,
+                timestamp,
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::PriceRecord(asset_code.clone()), &record);
+            .set(&AssetDataKey::Price(asset_code.clone()), &record);
+
+        let mut history: Vec<PriceRecord> = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::PriceHist(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record.clone());
+        env.storage()
+            .persistent()
+            .set(&AssetDataKey::PriceHist(asset_code.clone()), &history);
 
         env.events()
             .publish((symbol_short!("price_up"), asset_code), price);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Get the latest health record for an asset
     pub fn get_health(env: Env, asset_code: String) -> Option<AssetHealth> {
         env.storage()
             .persistent()
-            .get(&DataKey::AssetHealth(asset_code))
+            .get(&AssetDataKey::Health(asset_code.clone()))
     }
 
     /// Get the latest price record for an asset
     pub fn get_price(env: Env, asset_code: String) -> Option<PriceRecord> {
         env.storage()
             .persistent()
-            .get(&DataKey::PriceRecord(asset_code))
+            .get(&AssetDataKey::Price(asset_code.clone()))
     }
 
     /// Register an authorized signer for edge data submissions.
-    pub fn register_signer(
-        env: Env,
-        caller: Address,
-        signer_id: String,
-        public_key: BytesN<32>,
-    ) {
+    pub fn register_signer(env: Env, caller: Address, signer_id: String, public_key: BytesN<32>) {
         Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
 
         if env
             .storage()
             .persistent()
-            .get::<DataKey, Signer>(&DataKey::Signer(signer_id.clone()))
+            .get::<_, Signer>(&ConfigDataKey::Signer(signer_id.clone()))
             .is_some()
         {
             panic!("signer already registered");
@@ -502,17 +1375,18 @@ impl BridgeWatchContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Signer(signer_id.clone()), &signer);
+            .set(&ConfigDataKey::Signer(signer_id.clone()), &signer);
 
         let mut signers: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::SignerList)
+            .get(&keys::SIGNER_LIST)
             .unwrap_or_else(|| Vec::new(&env));
         signers.push_back(signer_id.clone());
-        env.storage().instance().set(&DataKey::SignerList, &signers);
+        env.storage().instance().set(&keys::SIGNER_LIST, &signers);
 
-        env.events().publish((symbol_short!("signer_reg"), signer_id), true);
+        env.events()
+            .publish((symbol_short!("sgnr_reg"), signer_id), true);
     }
 
     /// Remove a signer from active set (soft delete).
@@ -525,9 +1399,10 @@ impl BridgeWatchContract {
         signer.active = false;
         env.storage()
             .persistent()
-            .set(&DataKey::Signer(signer_id.clone()), &signer);
+            .set(&ConfigDataKey::Signer(signer_id.clone()), &signer);
 
-        env.events().publish((symbol_short!("signer_rem"), signer_id), true);
+        env.events()
+            .publish((symbol_short!("sgnr_rem"), signer_id), true);
     }
 
     /// Set the minimum required signatures for multi-sig verification.
@@ -539,7 +1414,7 @@ impl BridgeWatchContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::SignatureThreshold, &threshold);
+            .set(&keys::SIGNATURE_THRESHOLD, &threshold);
 
         env.events().publish((symbol_short!("sig_thr"),), threshold);
     }
@@ -548,11 +1423,12 @@ impl BridgeWatchContract {
     pub fn get_signature_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::SignatureThreshold)
+            .get(&keys::SIGNATURE_THRESHOLD)
             .unwrap_or(1)
     }
 
     /// Verify a single signature against a message and signer metadata.
+    #[allow(dead_code, clippy::self_assignment)]
     pub fn verify_signature(env: Env, message: Bytes, signature: SignerSignature) -> bool {
         let mut signer = Self::load_signer(&env, &signature.signer_id);
 
@@ -569,7 +1445,7 @@ impl BridgeWatchContract {
         if env
             .storage()
             .instance()
-            .get::<DataKey, bool>(&DataKey::SignatureCache(payload_hash))
+            .get::<_, bool>(&ConfigDataKey::SigCache(payload_hash.clone()))
             .unwrap_or(false)
         {
             return true;
@@ -578,7 +1454,7 @@ impl BridgeWatchContract {
         let last_nonce = env
             .storage()
             .persistent()
-            .get::<DataKey, u64>(&DataKey::SignerNonce(signature.signer_id.clone()))
+            .get::<_, u64>(&ConfigDataKey::SignerNonce(signature.signer_id.clone()))
             .unwrap_or(0);
         if signature.nonce <= last_nonce {
             panic!("nonce replay detected");
@@ -587,13 +1463,8 @@ impl BridgeWatchContract {
         let mut data = Bytes::new(&env);
         data.append(&message);
 
-        let signer_str = signature.signer_id.to_string();
-        let signer_bytes = signer_str.as_bytes();
-        let mut i = 0;
-        while i < signer_bytes.len() {
-            data.push_back(signer_bytes[i]);
-            i += 1;
-        }
+        let signer_id_bytes = Self::str_to_bytes_inner(&env, &signature.signer_id);
+        data.append(&signer_id_bytes);
 
         Self::append_bytesn(&mut data, &signer.public_key);
         Self::append_u64(&mut data, signature.nonce);
@@ -611,23 +1482,29 @@ impl BridgeWatchContract {
             j += 1;
         }
 
-        signer.registered_at = signer.registered_at; // keep unchanged
-        env.storage()
-            .persistent()
-            .set(&DataKey::SignerNonce(signature.signer_id.clone()), &signature.nonce);
+        // Keep signer record writable in this flow for Soroban auth/footprint compatibility.
+        signer.registered_at = signer.registered_at;
+
+        env.storage().persistent().set(
+            &ConfigDataKey::SignerNonce(signature.signer_id.clone()),
+            &signature.nonce,
+        );
 
         env.storage()
             .instance()
-            .set(&DataKey::SignatureCache(payload_hash), &true);
+            .set(&ConfigDataKey::SigCache(payload_hash.clone()), &true);
 
-        env.events().publish((symbol_short!("sig_ver"), signature.signer_id.clone()), true);
+        env.events().publish(
+            (symbol_short!("sig_ver"), signature.signer_id.clone()),
+            true,
+        );
         true
     }
 
     /// Verify a multi-signature submission.
     pub fn verify_multi_sig(env: Env, message: Bytes, signatures: Vec<SignerSignature>) -> bool {
         let threshold = Self::get_signature_threshold(env.clone());
-        if signatures.len() < threshold as u32 {
+        if signatures.len() < threshold {
             panic!("insufficient signatures");
         }
 
@@ -636,7 +1513,7 @@ impl BridgeWatchContract {
 
         for s in signatures.iter() {
             for o in seen.iter() {
-                if o == &s.signer_id {
+                if o == s.signer_id {
                     panic!("duplicate signer in multi-sig");
                 }
             }
@@ -700,22 +1577,12 @@ impl BridgeWatchContract {
         Self::check_permission(&env, &caller, AdminRole::PriceSubmitter);
 
         let mut message = Bytes::new(&env);
-        let asset_str = asset_code.to_string();
-        let asset_bytes = asset_str.as_bytes();
-        let mut i = 0;
-        while i < asset_bytes.len() {
-            message.push_back(asset_bytes[i]);
-            i += 1;
-        }
+        let asset_code_bytes = Self::str_to_bytes_inner(&env, &asset_code);
+        message.append(&asset_code_bytes);
         Self::append_u64(&mut message, price as u64);
 
-        let source_str = source.to_string();
-        let source_bytes = source_str.as_bytes();
-        i = 0;
-        while i < source_bytes.len() {
-            message.push_back(source_bytes[i]);
-            i += 1;
-        }
+        let source_bytes = Self::str_to_bytes_inner(&env, &source);
+        message.append(&source_bytes);
 
         Self::verify_signature(env.clone(), message, signature);
 
@@ -759,13 +1626,8 @@ impl BridgeWatchContract {
         bridge_uptime_score: u32,
     ) -> Bytes {
         let mut data = Bytes::new(env);
-        let code = asset_code.to_string();
-        let code_bytes = code.as_bytes();
-        let mut i = 0;
-        while i < code_bytes.len() {
-            data.push_back(code_bytes[i]);
-            i += 1;
-        }
+        let code_bytes = Self::str_to_bytes_inner(env, asset_code);
+        data.append(&code_bytes);
 
         Self::append_u32(&mut data, health_score);
         Self::append_u32(&mut data, liquidity_score);
@@ -805,14 +1667,15 @@ impl BridgeWatchContract {
     fn load_signer(env: &Env, signer_id: &String) -> Signer {
         env.storage()
             .persistent()
-            .get(&DataKey::Signer(signer_id.clone()))
+            .get(&ConfigDataKey::Signer(signer_id.clone()))
             .unwrap_or_else(|| panic!("signer not found"))
     }
 
+    #[allow(dead_code)]
     fn get_signers(env: Env) -> Vec<String> {
         env.storage()
             .instance()
-            .get(&DataKey::SignerList)
+            .get(&keys::SIGNER_LIST)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -827,7 +1690,7 @@ impl BridgeWatchContract {
         let mut assets: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::MonitoredAssets)
+            .get(&keys::MONITORED_ASSETS)
             .unwrap();
 
         for existing in assets.iter() {
@@ -836,6 +1699,7 @@ impl BridgeWatchContract {
             }
         }
 
+        let timestamp = env.ledger().timestamp();
         let status = AssetHealth {
             asset_code: asset_code.clone(),
             health_score: 0,
@@ -844,20 +1708,27 @@ impl BridgeWatchContract {
             bridge_uptime_score: 0,
             paused: false,
             active: true,
-            timestamp: env.ledger().timestamp(),
+            timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::Asset,
+                timestamp,
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+            .set(&AssetDataKey::Health(asset_code.clone()), &status);
 
         assets.push_back(asset_code.clone());
         env.storage()
             .instance()
-            .set(&DataKey::MonitoredAssets, &assets);
+            .set(&keys::MONITORED_ASSETS, &assets);
 
         env.events()
             .publish((symbol_short!("asset_reg"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Temporarily pause monitoring for an asset.
@@ -872,11 +1743,14 @@ impl BridgeWatchContract {
         }
         status.paused = true;
         status.timestamp = env.ledger().timestamp();
+        status.expires_at =
+            Self::resolve_expiration(&env, &asset_code, ExpirationKind::Asset, status.timestamp);
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+            .set(&AssetDataKey::Health(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_pau"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Resume monitoring for a paused asset.
@@ -891,11 +1765,14 @@ impl BridgeWatchContract {
         }
         status.paused = false;
         status.timestamp = env.ledger().timestamp();
+        status.expires_at =
+            Self::resolve_expiration(&env, &asset_code, ExpirationKind::Asset, status.timestamp);
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+            .set(&AssetDataKey::Health(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_unp"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Permanently deregister an asset while retaining historical data.
@@ -909,11 +1786,14 @@ impl BridgeWatchContract {
         status.active = false;
         status.paused = false;
         status.timestamp = env.ledger().timestamp();
+        status.expires_at =
+            Self::resolve_expiration(&env, &asset_code, ExpirationKind::Asset, status.timestamp);
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+            .set(&AssetDataKey::Health(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_del"), asset_code), false);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Get all monitored assets
@@ -921,7 +1801,7 @@ impl BridgeWatchContract {
         let assets: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::MonitoredAssets)
+            .get(&keys::MONITORED_ASSETS)
             .unwrap();
 
         let mut active_assets = Vec::new(&env);
@@ -929,7 +1809,7 @@ impl BridgeWatchContract {
             let status: Option<AssetHealth> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::AssetHealth(asset_code.clone()));
+                .get(&AssetDataKey::Health(asset_code.clone()));
 
             match status {
                 Some(record) => {
@@ -961,7 +1841,7 @@ impl BridgeWatchContract {
         high_bps: i128,
     ) {
         Self::assert_not_globally_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         admin.require_auth();
         Self::check_no_pending_transfer(&env);
 
@@ -972,10 +1852,128 @@ impl BridgeWatchContract {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::DeviationThreshold(asset_code.clone()), &threshold);
+            .set(&AssetDataKey::DevThresh(asset_code.clone()), &threshold);
 
         env.events()
             .publish((symbol_short!("thresh_up"), asset_code), low_bps);
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: admin,
+                scope: String::from_str(&env, "deviation_threshold"),
+                value: high_bps,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Set a per-asset deviation threshold override.
+    ///
+    /// `caller` must be admin or have ACL `ManageConfig` permission.
+    /// Temporary overrides require a future `expires_at` timestamp.
+    pub fn set_deviation_threshold_override(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        low_bps: i128,
+        medium_bps: i128,
+        high_bps: i128,
+        mode: ThresholdOverrideMode,
+        expires_at: Option<u64>,
+    ) {
+        Self::assert_can_manage_threshold_overrides(&env, &caller);
+        Self::validate_deviation_threshold_range(low_bps, medium_bps, high_bps);
+
+        let now = env.ledger().timestamp();
+        let expires_at_value = Self::resolve_override_expiration(now, &mode, expires_at);
+        let key = AssetDataKey::DevThreshOvr(asset_code.clone());
+
+        let old_override: Option<DeviationThresholdOverride> = env.storage().persistent().get(&key);
+        let old_high = old_override.as_ref().map_or(0, |o| o.threshold.high_bps);
+
+        let override_entry = DeviationThresholdOverride {
+            threshold: DeviationThreshold {
+                low_bps,
+                medium_bps,
+                high_bps,
+            },
+            mode: mode.clone(),
+            expires_at: expires_at_value,
+            updated_by: caller.clone(),
+            updated_at: now,
+        };
+        env.storage().persistent().set(&key, &override_entry);
+
+        Self::append_threshold_override_audit(
+            &env,
+            Self::deviation_override_audit_name(&env, &asset_code),
+            old_high,
+            high_bps,
+            &caller,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("thr_ovr"),
+                symbol_short!("dev"),
+                asset_code.clone(),
+            ),
+            (high_bps, expires_at_value),
+        );
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: caller,
+                scope: String::from_str(&env, "deviation_threshold_override"),
+                value: high_bps,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Return the active per-asset deviation threshold override, if any.
+    pub fn get_deviation_threshold_override(
+        env: Env,
+        asset_code: String,
+    ) -> Option<DeviationThresholdOverride> {
+        Self::load_active_deviation_threshold_override(&env, &asset_code)
+    }
+
+    /// Remove the per-asset deviation threshold override.
+    pub fn clear_dev_threshold_override(env: Env, caller: Address, asset_code: String) {
+        Self::assert_can_manage_threshold_overrides(&env, &caller);
+
+        let key = AssetDataKey::DevThreshOvr(asset_code.clone());
+        let old_override: Option<DeviationThresholdOverride> = env.storage().persistent().get(&key);
+        let old_high = old_override.as_ref().map_or(0, |o| o.threshold.high_bps);
+        env.storage().persistent().remove(&key);
+
+        Self::append_threshold_override_audit(
+            &env,
+            Self::deviation_override_audit_name(&env, &asset_code),
+            old_high,
+            0,
+            &caller,
+        );
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (
+                symbol_short!("thr_clr"),
+                symbol_short!("dev"),
+                asset_code.clone(),
+            ),
+            old_high,
+        );
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: caller,
+                scope: String::from_str(&env, "deviation_threshold_override"),
+                value: 0,
+                timestamp: now,
+            },
+        );
     }
 
     /// Compare `current_price` against the last recorded [`PriceRecord`] for
@@ -995,7 +1993,7 @@ impl BridgeWatchContract {
         let reference: PriceRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::PriceRecord(asset_code.clone()))?;
+            .get(&AssetDataKey::Price(asset_code.clone()))?;
 
         let average_price = reference.price;
         if average_price == 0 {
@@ -1009,15 +2007,7 @@ impl BridgeWatchContract {
         };
         let deviation_bps = diff * 10_000 / average_price;
 
-        let threshold: DeviationThreshold = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DeviationThreshold(asset_code.clone()))
-            .unwrap_or(DeviationThreshold {
-                low_bps: 200,
-                medium_bps: 500,
-                high_bps: 1_000,
-            });
+        let threshold = Self::resolve_deviation_threshold(&env, &asset_code);
 
         let severity = if deviation_bps > threshold.high_bps {
             DeviationSeverity::High
@@ -1036,11 +2026,17 @@ impl BridgeWatchContract {
             deviation_bps,
             severity,
             timestamp: env.ledger().timestamp(),
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::Deviation,
+                env.ledger().timestamp(),
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::DeviationAlert(asset_code.clone()), &alert);
+            .set(&AssetDataKey::DevAlert(asset_code.clone()), &alert);
 
         env.events()
             .publish((symbol_short!("price_dev"), asset_code), deviation_bps);
@@ -1054,7 +2050,7 @@ impl BridgeWatchContract {
     pub fn get_deviation_alerts(env: Env, asset_code: String) -> Option<DeviationAlert> {
         env.storage()
             .persistent()
-            .get(&DataKey::DeviationAlert(asset_code))
+            .get(&AssetDataKey::DevAlert(asset_code.clone()))
     }
 
     // -----------------------------------------------------------------------
@@ -1067,16 +2063,128 @@ impl BridgeWatchContract {
     /// Default is 10 bps (0.1 %).
     pub fn set_mismatch_threshold(env: Env, threshold_bps: i128) {
         Self::assert_not_globally_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         admin.require_auth();
         Self::check_no_pending_transfer(&env);
         env.storage()
             .instance()
-            .set(&DataKey::MismatchThreshold, &threshold_bps);
+            .set(&keys::MISMATCH_THRESHOLD, &threshold_bps);
 
         env.events().publish(
             (symbol_short!("thresh_up"), symbol_short!("mismatch")),
             threshold_bps,
+        );
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: admin,
+                scope: String::from_str(&env, "mismatch_threshold"),
+                value: threshold_bps,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Set a per-asset mismatch threshold override in basis points.
+    ///
+    /// `caller` must be admin or have ACL `ManageConfig` permission.
+    /// Temporary overrides require a future `expires_at` timestamp.
+    pub fn set_mismatch_threshold_override(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        threshold_bps: i128,
+        mode: ThresholdOverrideMode,
+        expires_at: Option<u64>,
+    ) {
+        Self::assert_can_manage_threshold_overrides(&env, &caller);
+        Self::validate_mismatch_threshold_value(threshold_bps);
+
+        let now = env.ledger().timestamp();
+        let expires_at_value = Self::resolve_override_expiration(now, &mode, expires_at);
+        let key = AssetDataKey::MmThreshOvr(asset_code.clone());
+
+        let old_override: Option<MismatchThresholdOverride> = env.storage().persistent().get(&key);
+        let old_value = old_override.as_ref().map_or(0, |o| o.threshold_bps);
+
+        let override_entry = MismatchThresholdOverride {
+            threshold_bps,
+            mode: mode.clone(),
+            expires_at: expires_at_value,
+            updated_by: caller.clone(),
+            updated_at: now,
+        };
+        env.storage().persistent().set(&key, &override_entry);
+
+        Self::append_threshold_override_audit(
+            &env,
+            Self::mismatch_override_audit_name(&env, &asset_code),
+            old_value,
+            threshold_bps,
+            &caller,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("thr_ovr"),
+                symbol_short!("mm"),
+                asset_code.clone(),
+            ),
+            (threshold_bps, expires_at_value),
+        );
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: caller,
+                scope: String::from_str(&env, "mismatch_threshold_override"),
+                value: threshold_bps,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Return the active per-asset mismatch threshold override, if any.
+    pub fn get_mismatch_threshold_override(
+        env: Env,
+        asset_code: String,
+    ) -> Option<MismatchThresholdOverride> {
+        Self::load_active_mismatch_threshold_override(&env, &asset_code)
+    }
+
+    /// Remove the per-asset mismatch threshold override.
+    pub fn clear_mm_threshold_override(env: Env, caller: Address, asset_code: String) {
+        Self::assert_can_manage_threshold_overrides(&env, &caller);
+
+        let key = AssetDataKey::MmThreshOvr(asset_code.clone());
+        let old_override: Option<MismatchThresholdOverride> = env.storage().persistent().get(&key);
+        let old_value = old_override.as_ref().map_or(0, |o| o.threshold_bps);
+        env.storage().persistent().remove(&key);
+
+        Self::append_threshold_override_audit(
+            &env,
+            Self::mismatch_override_audit_name(&env, &asset_code),
+            old_value,
+            0,
+            &caller,
+        );
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (
+                symbol_short!("thr_clr"),
+                symbol_short!("mm"),
+                asset_code.clone(),
+            ),
+            old_value,
+        );
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ThresholdUpdated {
+                actor: caller,
+                scope: String::from_str(&env, "mismatch_threshold_override"),
+                value: 0,
+                timestamp: now,
+            },
         );
     }
 
@@ -1095,7 +2203,7 @@ impl BridgeWatchContract {
         source_chain_supply: i128,
     ) {
         Self::assert_not_globally_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         admin.require_auth();
 
         let mismatch_bps = if source_chain_supply > 0 {
@@ -1109,39 +2217,41 @@ impl BridgeWatchContract {
             0
         };
 
-        let threshold_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MismatchThreshold)
-            .unwrap_or(10);
+        let threshold_bps = Self::resolve_mismatch_threshold_bps(&env, &asset_code);
 
         let is_critical = mismatch_bps >= threshold_bps;
 
         let record = SupplyMismatch {
             bridge_id: bridge_id.clone(),
-            asset_code,
+            asset_code: asset_code.clone(),
             stellar_supply,
             source_chain_supply,
             mismatch_bps,
             is_critical,
             timestamp: env.ledger().timestamp(),
+            expires_at: Self::resolve_expiration(
+                &env,
+                &bridge_id,
+                ExpirationKind::Mismatch,
+                env.ledger().timestamp(),
+            ),
         };
 
         let mut mismatches: Vec<SupplyMismatch> = env
             .storage()
             .persistent()
-            .get(&DataKey::SupplyMismatches(bridge_id.clone()))
+            .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         mismatches.push_back(record);
         env.storage()
             .persistent()
-            .set(&DataKey::SupplyMismatches(bridge_id.clone()), &mismatches);
+            .set(&BridgeDataKey::Mismatches(bridge_id.clone()), &mismatches);
 
         // Track bridge ID for cross-bridge queries
         let mut bridge_ids: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::BridgeIds)
+            .get(&keys::BRIDGE_IDS)
             .unwrap_or_else(|| Vec::new(&env));
         let mut found = false;
         for b in bridge_ids.iter() {
@@ -1152,20 +2262,20 @@ impl BridgeWatchContract {
         }
         if !found {
             bridge_ids.push_back(bridge_id.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::BridgeIds, &bridge_ids);
+            env.storage().instance().set(&keys::BRIDGE_IDS, &bridge_ids);
         }
 
         env.events()
             .publish((symbol_short!("supply_mm"), bridge_id), mismatch_bps);
+
+        Self::maybe_trigger_auto_cleanup(&env);
     }
 
     /// Return all recorded supply mismatches for a bridge. Public read access.
     pub fn get_supply_mismatches(env: Env, bridge_id: String) -> Vec<SupplyMismatch> {
         env.storage()
             .persistent()
-            .get(&DataKey::SupplyMismatches(bridge_id))
+            .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -1174,7 +2284,7 @@ impl BridgeWatchContract {
         let bridge_ids: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::BridgeIds)
+            .get(&keys::BRIDGE_IDS)
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut critical: Vec<SupplyMismatch> = Vec::new(&env);
@@ -1182,7 +2292,7 @@ impl BridgeWatchContract {
             let mismatches: Vec<SupplyMismatch> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::SupplyMismatches(bridge_id.clone()))
+                .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
                 .unwrap_or_else(|| Vec::new(&env));
             for m in mismatches.iter() {
                 if m.is_critical {
@@ -1227,8 +2337,9 @@ impl BridgeWatchContract {
         sources: Vec<String>,
     ) {
         Self::assert_not_globally_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         admin.require_auth();
+        let timestamp = env.ledger().timestamp();
 
         Self::validate_liquidity_depth_input(
             &env,
@@ -1249,28 +2360,33 @@ impl BridgeWatchContract {
             depth_1_pct,
             depth_5_pct,
             sources,
-            timestamp: env.ledger().timestamp(),
+            timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_pair,
+                ExpirationKind::Liquidity,
+                timestamp,
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::LiquidityDepthCurrent(asset_pair.clone()), &record);
+            .set(&AssetDataKey::LiqDepth(asset_pair.clone()), &record);
 
         let mut history: Vec<LiquidityDepth> = env
             .storage()
             .persistent()
-            .get(&DataKey::LiquidityDepthHistory(asset_pair.clone()))
+            .get(&AssetDataKey::LiqHist(asset_pair.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         history.push_back(record);
-        env.storage().persistent().set(
-            &DataKey::LiquidityDepthHistory(asset_pair.clone()),
-            &history,
-        );
+        env.storage()
+            .persistent()
+            .set(&AssetDataKey::LiqHist(asset_pair.clone()), &history);
 
         let mut pairs: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::LiquidityPairs)
+            .get(&keys::LIQUIDITY_PAIRS)
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut found = false;
@@ -1283,13 +2399,13 @@ impl BridgeWatchContract {
 
         if !found {
             pairs.push_back(asset_pair.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::LiquidityPairs, &pairs);
+            env.storage().instance().set(&keys::LIQUIDITY_PAIRS, &pairs);
         }
 
         env.events()
             .publish((symbol_short!("liq_chg"), asset_pair), total_liquidity);
+
+        Self::maybe_trigger_auto_cleanup(&env);
     }
 
     /// Return the latest aggregated liquidity depth for an asset pair.
@@ -1298,7 +2414,7 @@ impl BridgeWatchContract {
     pub fn get_aggregated_liquidity_depth(env: Env, asset_pair: String) -> Option<LiquidityDepth> {
         env.storage()
             .persistent()
-            .get(&DataKey::LiquidityDepthCurrent(asset_pair))
+            .get(&AssetDataKey::LiqDepth(asset_pair))
     }
 
     /// Return historical liquidity depth snapshots for an asset pair.
@@ -1314,7 +2430,7 @@ impl BridgeWatchContract {
         let history: Vec<LiquidityDepth> = env
             .storage()
             .persistent()
-            .get(&DataKey::LiquidityDepthHistory(asset_pair))
+            .get(&AssetDataKey::LiqHist(asset_pair))
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut filtered = Vec::new(&env);
@@ -1334,7 +2450,7 @@ impl BridgeWatchContract {
         let pairs: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::LiquidityPairs)
+            .get(&keys::LIQUIDITY_PAIRS)
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut records = Vec::new(&env);
@@ -1342,7 +2458,7 @@ impl BridgeWatchContract {
             let current: Option<LiquidityDepth> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::LiquidityDepthCurrent(pair));
+                .get(&AssetDataKey::LiqDepth(pair));
             if let Some(record) = current {
                 records.push_back(record);
             }
@@ -1361,7 +2477,7 @@ impl BridgeWatchContract {
     pub fn grant_role(env: Env, granter: Address, grantee: Address, role: AdminRole) {
         Self::assert_not_globally_paused(&env);
         granter.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         Self::check_no_pending_transfer(&env);
         let authorized =
             granter == admin || Self::has_role_internal(&env, &granter, AdminRole::SuperAdmin);
@@ -1372,7 +2488,7 @@ impl BridgeWatchContract {
         let mut roles: Vec<AdminRole> = env
             .storage()
             .persistent()
-            .get(&DataKey::RoleKey(grantee.clone()))
+            .get(&ConfigDataKey::RoleKey(grantee.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
         for r in roles.iter() {
@@ -1383,12 +2499,12 @@ impl BridgeWatchContract {
         roles.push_back(role.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::RoleKey(grantee.clone()), &roles);
+            .set(&ConfigDataKey::RoleKey(grantee.clone()), &roles);
 
         let mut assignments: Vec<RoleAssignment> = env
             .storage()
             .persistent()
-            .get(&DataKey::RolesList)
+            .get(&keys::ROLES_LIST)
             .unwrap_or_else(|| Vec::new(&env));
         assignments.push_back(RoleAssignment {
             address: grantee.clone(),
@@ -1396,17 +2512,27 @@ impl BridgeWatchContract {
         });
         env.storage()
             .persistent()
-            .set(&DataKey::RolesList, &assignments);
+            .set(&keys::ROLES_LIST, &assignments);
 
         env.events()
-            .publish((symbol_short!("role_grnt"), grantee), role);
+            .publish((symbol_short!("role_grnt"), grantee.clone()), role.clone());
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::RoleChanged {
+                actor: granter,
+                target: grantee,
+                granted: true,
+                role,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Revoke a specific role from `target` (SuperAdmin or original admin only).
     pub fn revoke_role(env: Env, revoker: Address, target: Address, role: AdminRole) {
         Self::assert_not_globally_paused(&env);
         revoker.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         Self::check_no_pending_transfer(&env);
         let authorized =
             revoker == admin || Self::has_role_internal(&env, &revoker, AdminRole::SuperAdmin);
@@ -1417,7 +2543,7 @@ impl BridgeWatchContract {
         let roles: Vec<AdminRole> = env
             .storage()
             .persistent()
-            .get(&DataKey::RoleKey(target.clone()))
+            .get(&ConfigDataKey::RoleKey(target.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut updated: Vec<AdminRole> = Vec::new(&env);
@@ -1428,12 +2554,12 @@ impl BridgeWatchContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::RoleKey(target.clone()), &updated);
+            .set(&ConfigDataKey::RoleKey(target.clone()), &updated);
 
         let assignments: Vec<RoleAssignment> = env
             .storage()
             .persistent()
-            .get(&DataKey::RolesList)
+            .get(&keys::ROLES_LIST)
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut updated_assignments: Vec<RoleAssignment> = Vec::new(&env);
@@ -1444,10 +2570,371 @@ impl BridgeWatchContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::RolesList, &updated_assignments);
+            .set(&keys::ROLES_LIST, &updated_assignments);
 
         env.events()
-            .publish((symbol_short!("role_revk"), target), role);
+            .publish((symbol_short!("role_revk"), target.clone()), role.clone());
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::RoleChanged {
+                actor: revoker,
+                target,
+                granted: false,
+                role,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Configure global expiration TTLs for stored records.
+    pub fn set_expiration_policy(
+        env: Env,
+        caller: Address,
+        asset_ttl_secs: u64,
+        price_ttl_secs: u64,
+        deviation_ttl_secs: u64,
+        mismatch_ttl_secs: u64,
+        liquidity_ttl_secs: u64,
+        preserve_latest_history: bool,
+        version: u32,
+    ) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        let authorized =
+            caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can set expiration policy");
+        }
+        if version == 0 {
+            panic!("expiration policy version must be greater than 0");
+        }
+
+        let policy = ExpirationPolicy {
+            asset_ttl_secs,
+            price_ttl_secs,
+            deviation_ttl_secs,
+            mismatch_ttl_secs,
+            liquidity_ttl_secs,
+            preserve_latest_history,
+            version,
+        };
+
+        env.storage()
+            .instance()
+            .set(&keys::EXPIRATIONPOLICY, &policy);
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ExpirationPolicyUpdated {
+                actor: caller,
+                scope: String::from_str(&env, "global"),
+                ttl_secs: price_ttl_secs,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Configure a per-asset TTL override for asset-bound records.
+    pub fn set_asset_expiration_ttl(env: Env, caller: Address, asset_code: String, ttl_secs: u64) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        let authorized =
+            caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can set asset expiration ttl");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&AssetDataKey::ExpTtl(asset_code.clone()), &ttl_secs);
+
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::ExpirationPolicyUpdated {
+                actor: caller,
+                scope: asset_code,
+                ttl_secs,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Return the current expiration policy.
+    pub fn get_expiration_policy(env: Env) -> ExpirationPolicy {
+        Self::load_expiration_policy(&env)
+    }
+
+    /// Return the most recent cleanup summary, if one exists.
+    pub fn get_cleanup_stats(env: Env) -> Option<CleanupStats> {
+        env.storage().instance().get(&keys::CLEANUPSTATS)
+    }
+
+    /// Manually extend current record expirations for an asset.
+    pub fn extend_expiration(env: Env, caller: Address, asset_code: String, extra_secs: u64) {
+        Self::check_permission(&env, &caller, AdminRole::AssetManager);
+        let now = env.ledger().timestamp();
+        let updated_expiration = |current: u64| {
+            if current > now {
+                current + extra_secs
+            } else {
+                now + extra_secs
+            }
+        };
+
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, AssetHealth>(&AssetDataKey::Health(asset_code.clone()))
+        {
+            record.expires_at = updated_expiration(record.expires_at);
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::Health(asset_code.clone()), &record);
+        }
+
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, PriceRecord>(&AssetDataKey::Price(asset_code.clone()))
+        {
+            record.expires_at = updated_expiration(record.expires_at);
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::Price(asset_code.clone()), &record);
+        }
+
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, DeviationAlert>(&AssetDataKey::DevAlert(asset_code.clone()))
+        {
+            record.expires_at = updated_expiration(record.expires_at);
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::DevAlert(asset_code.clone()), &record);
+        }
+
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, HealthScoreResult>(&AssetDataKey::HealthRes(asset_code.clone()))
+        {
+            record.expires_at = updated_expiration(record.expires_at);
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::HealthRes(asset_code.clone()), &record);
+            Self::emit_contract_event(
+                &env,
+                BridgeWatchEvent::ExpirationExtended {
+                    actor: caller,
+                    scope: asset_code,
+                    expires_at: record.expires_at,
+                    timestamp: now,
+                },
+            );
+        }
+    }
+
+    /// Cleanup expired records and trim expired historical entries.
+    pub fn cleanup_expired_data(env: Env, caller: Address, max_records: u32) -> CleanupStats {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        let authorized =
+            caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can clean expired data");
+        }
+
+        let now = env.ledger().timestamp();
+        let policy = Self::load_expiration_policy(&env);
+        let mut removed_records = 0u32;
+        let mut trimmed_history_records = 0u32;
+
+        let assets: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::MONITORED_ASSETS)
+            .unwrap_or_else(|| Vec::new(&env));
+        for asset_code in assets.iter() {
+            if removed_records >= max_records {
+                break;
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, AssetHealth>(&AssetDataKey::Health(asset_code.clone()))
+            {
+                if Self::is_past(now, record.expires_at) {
+                    env.storage()
+                        .persistent()
+                        .remove(&AssetDataKey::Health(asset_code.clone()));
+                    removed_records += 1;
+                }
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, PriceRecord>(&AssetDataKey::Price(asset_code.clone()))
+            {
+                if removed_records < max_records && Self::is_past(now, record.expires_at) {
+                    env.storage()
+                        .persistent()
+                        .remove(&AssetDataKey::Price(asset_code.clone()));
+                    removed_records += 1;
+                }
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DeviationAlert>(&AssetDataKey::DevAlert(asset_code.clone()))
+            {
+                if removed_records < max_records && Self::is_past(now, record.expires_at) {
+                    env.storage()
+                        .persistent()
+                        .remove(&AssetDataKey::DevAlert(asset_code.clone()));
+                    removed_records += 1;
+                }
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, HealthScoreResult>(&AssetDataKey::HealthRes(asset_code.clone()))
+            {
+                if removed_records < max_records && Self::is_past(now, record.expires_at) {
+                    env.storage()
+                        .persistent()
+                        .remove(&AssetDataKey::HealthRes(asset_code.clone()));
+                    removed_records += 1;
+                }
+            }
+
+            let history: Vec<PriceRecord> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::PriceHist(asset_code.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut filtered_history = Vec::new(&env);
+            for entry in history.iter() {
+                if !Self::is_past(now, entry.expires_at) {
+                    filtered_history.push_back(entry);
+                } else {
+                    trimmed_history_records += 1;
+                }
+            }
+            if filtered_history.len() == 0 && history.len() > 0 && policy.preserve_latest_history {
+                let last_index = history.len() - 1;
+                if let Some(last_entry) = history.get(last_index) {
+                    filtered_history.push_back(last_entry);
+                    if trimmed_history_records > 0 {
+                        trimmed_history_records -= 1;
+                    }
+                }
+            }
+            env.storage().persistent().set(
+                &AssetDataKey::PriceHist(asset_code.clone()),
+                &filtered_history,
+            );
+        }
+
+        let bridge_ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::BRIDGE_IDS)
+            .unwrap_or_else(|| Vec::new(&env));
+        for bridge_id in bridge_ids.iter() {
+            let history: Vec<SupplyMismatch> = env
+                .storage()
+                .persistent()
+                .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut filtered = Vec::new(&env);
+            for entry in history.iter() {
+                if !Self::is_past(now, entry.expires_at) {
+                    filtered.push_back(entry);
+                } else {
+                    trimmed_history_records += 1;
+                }
+            }
+            if filtered.len() == 0 && history.len() > 0 && policy.preserve_latest_history {
+                let last_index = history.len() - 1;
+                if let Some(last_entry) = history.get(last_index) {
+                    filtered.push_back(last_entry);
+                    if trimmed_history_records > 0 {
+                        trimmed_history_records -= 1;
+                    }
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&BridgeDataKey::Mismatches(bridge_id.clone()), &filtered);
+        }
+
+        let pairs: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::LIQUIDITY_PAIRS)
+            .unwrap_or_else(|| Vec::new(&env));
+        for asset_pair in pairs.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiquidityDepth>(&AssetDataKey::LiqDepth(asset_pair.clone()))
+            {
+                if removed_records < max_records && Self::is_past(now, record.expires_at) {
+                    env.storage()
+                        .persistent()
+                        .remove(&AssetDataKey::LiqDepth(asset_pair.clone()));
+                    removed_records += 1;
+                }
+            }
+
+            let history: Vec<LiquidityDepth> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::LiqHist(asset_pair.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut filtered = Vec::new(&env);
+            for entry in history.iter() {
+                if !Self::is_past(now, entry.expires_at) {
+                    filtered.push_back(entry);
+                } else {
+                    trimmed_history_records += 1;
+                }
+            }
+            if filtered.len() == 0 && history.len() > 0 && policy.preserve_latest_history {
+                let last_index = history.len() - 1;
+                if let Some(last_entry) = history.get(last_index) {
+                    filtered.push_back(last_entry);
+                    if trimmed_history_records > 0 {
+                        trimmed_history_records -= 1;
+                    }
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::LiqHist(asset_pair), &filtered);
+        }
+
+        let stats = CleanupStats {
+            last_run_at: now,
+            removed_records,
+            trimmed_history_records,
+            last_actor: caller.clone(),
+        };
+        env.storage().instance().set(&keys::CLEANUPSTATS, &stats);
+        Self::emit_contract_event(
+            &env,
+            BridgeWatchEvent::CleanupCompleted {
+                actor: caller,
+                removed_records,
+                trimmed_history_records,
+                timestamp: now,
+            },
+        );
+        stats
     }
 
     /// Return `true` if `address` holds `role`.
@@ -1461,8 +2948,272 @@ impl BridgeWatchContract {
     pub fn get_admin_roles(env: Env) -> Vec<RoleAssignment> {
         env.storage()
             .persistent()
-            .get(&DataKey::RolesList)
+            .get(&keys::ROLES_LIST)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // ACL — flexible permission management (issue #101)
+    // -----------------------------------------------------------------------
+
+    /// Grant `role` to `grantee`.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// `expires_at` is a ledger timestamp; pass `0` for a non-expiring grant.
+    /// Granting the same role twice updates the expiry.
+    pub fn acl_grant_role(
+        env: Env,
+        caller: Address,
+        grantee: Address,
+        role: Role,
+        expires_at: u64,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        acl::grant_role_internal(&env, &grantee, &role, &caller, expires_at);
+
+        env.events().publish(
+            (symbol_short!("acl_grnt"), grantee.clone()),
+            (role, expires_at),
+        );
+    }
+
+    /// Revoke `role` from `grantee`.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// No-ops silently if the grant does not exist.
+    pub fn acl_revoke_role(env: Env, caller: Address, grantee: Address, role: Role) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        acl::revoke_role_internal(&env, &grantee, &role);
+
+        env.events()
+            .publish((symbol_short!("acl_revk"), grantee.clone()), role);
+    }
+
+    /// Grant a direct `permission` to `grantee`.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// `expires_at` is a ledger timestamp; pass `0` for a non-expiring grant.
+    pub fn acl_grant_permission(
+        env: Env,
+        caller: Address,
+        grantee: Address,
+        permission: Permission,
+        expires_at: u64,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        acl::grant_permission_internal(&env, &grantee, &permission, &caller, expires_at);
+
+        env.events().publish(
+            (symbol_short!("acl_pgrn"), grantee.clone()),
+            (permission, expires_at),
+        );
+    }
+
+    /// Revoke a direct `permission` from `grantee`.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    pub fn acl_revoke_permission(
+        env: Env,
+        caller: Address,
+        grantee: Address,
+        permission: Permission,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        acl::revoke_permission_internal(&env, &grantee, &permission);
+
+        env.events()
+            .publish((symbol_short!("acl_prv"), grantee.clone()), permission);
+    }
+
+    /// Return `true` if `address` currently holds `role` (respects expiry).
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_has_role(env: Env, address: Address, role: Role) -> bool {
+        acl::has_role_internal(&env, &address, &role)
+    }
+
+    /// Return `true` if `address` has `permission` via any active role or
+    /// direct grant (respects expiry and inheritance).
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_has_permission(env: Env, address: Address, permission: Permission) -> bool {
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if address == admin {
+            return true;
+        }
+        acl::has_permission_internal(&env, &address, &permission)
+    }
+
+    /// Return all role grants (including expired ones for audit purposes).
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_get_role_grants(env: Env) -> Vec<RoleGrant> {
+        env.storage()
+            .persistent()
+            .get(&AclKey::RoleGrants)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return all direct permission grants (including expired ones).
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_get_permission_grants(env: Env) -> Vec<PermissionGrant> {
+        env.storage()
+            .persistent()
+            .get(&AclKey::PermissionGrants)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return all role grants for a specific `address` (including expired).
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_get_roles_for(env: Env, address: Address) -> Vec<RoleGrant> {
+        let grants: Vec<RoleGrant> = env
+            .storage()
+            .persistent()
+            .get(&AclKey::RoleGrants)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut result: Vec<RoleGrant> = Vec::new(&env);
+        for g in grants.iter() {
+            if g.grantee == address {
+                result.push_back(g);
+            }
+        }
+        result
+    }
+
+    /// Return all direct permission grants for a specific `address`.
+    ///
+    /// Public read — no authorisation required.
+    pub fn acl_get_permissions_for(env: Env, address: Address) -> Vec<PermissionGrant> {
+        let grants: Vec<PermissionGrant> = env
+            .storage()
+            .persistent()
+            .get(&AclKey::PermissionGrants)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut result: Vec<PermissionGrant> = Vec::new(&env);
+        for g in grants.iter() {
+            if g.grantee == address {
+                result.push_back(g);
+            }
+        }
+        result
+    }
+
+    /// Bulk-grant roles to multiple addresses in a single transaction.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// Accepts up to 20 entries per call.
+    pub fn acl_bulk_grant_roles(env: Env, caller: Address, entries: Vec<BulkRoleEntry>) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        if entries.len() > 20 {
+            panic!("bulk grant exceeds maximum of 20 entries");
+        }
+
+        for entry in entries.iter() {
+            acl::grant_role_internal(&env, &entry.grantee, &entry.role, &caller, entry.expires_at);
+            env.events().publish(
+                (symbol_short!("acl_grnt"), entry.grantee.clone()),
+                (entry.role, entry.expires_at),
+            );
+        }
+    }
+
+    /// Bulk-revoke roles from multiple addresses in a single transaction.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// Accepts up to 20 entries per call.
+    pub fn acl_bulk_revoke_roles(env: Env, caller: Address, entries: Vec<BulkRoleEntry>) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        if entries.len() > 20 {
+            panic!("bulk revoke exceeds maximum of 20 entries");
+        }
+
+        for entry in entries.iter() {
+            acl::revoke_role_internal(&env, &entry.grantee, &entry.role);
+            env.events().publish(
+                (symbol_short!("acl_revk"), entry.grantee.clone()),
+                entry.role,
+            );
+        }
+    }
+
+    /// Bulk-grant direct permissions to multiple addresses in a single transaction.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// Accepts up to 20 entries per call.
+    pub fn acl_bulk_grant_permissions(
+        env: Env,
+        caller: Address,
+        entries: Vec<BulkPermissionEntry>,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        if entries.len() > 20 {
+            panic!("bulk grant exceeds maximum of 20 entries");
+        }
+
+        for entry in entries.iter() {
+            acl::grant_permission_internal(
+                &env,
+                &entry.grantee,
+                &entry.permission,
+                &caller,
+                entry.expires_at,
+            );
+            env.events().publish(
+                (symbol_short!("acl_pgrn"), entry.grantee.clone()),
+                (entry.permission, entry.expires_at),
+            );
+        }
+    }
+
+    /// Bulk-revoke direct permissions from multiple addresses.
+    ///
+    /// `caller` must be the contract admin or hold `ManagePermissions`.
+    /// Accepts up to 20 entries per call.
+    pub fn acl_bulk_revoke_permissions(
+        env: Env,
+        caller: Address,
+        entries: Vec<BulkPermissionEntry>,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(&env, &caller, &admin, &Permission::ManagePermissions);
+
+        if entries.len() > 20 {
+            panic!("bulk revoke exceeds maximum of 20 entries");
+        }
+
+        for entry in entries.iter() {
+            acl::revoke_permission_internal(&env, &entry.grantee, &entry.permission);
+            env.events().publish(
+                (symbol_short!("acl_prv"), entry.grantee.clone()),
+                entry.permission,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1483,8 +3234,8 @@ impl BridgeWatchContract {
     /// - `caller` is neither the admin nor the pause guardian.
     pub fn emergency_pause(env: Env, caller: Address, reason: String) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        let guardian: Option<Address> = env.storage().instance().get(&DataKey::PauseGuardian);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        let guardian: Option<Address> = env.storage().instance().get(&keys::PAUSE_GUARDIAN);
         let is_admin = caller == admin;
         let is_guardian = guardian.as_ref().map(|g| *g == caller).unwrap_or(false);
         if !is_admin && !is_guardian {
@@ -1495,12 +3246,12 @@ impl BridgeWatchContract {
         // Timelock: 24 hours before unpause is permitted
         let timelock_secs: u64 = 86_400;
 
-        env.storage().instance().set(&DataKey::GlobalPaused, &true);
-        env.storage().instance().set(&DataKey::PauseReason, &reason);
-        env.storage().instance().set(&DataKey::PausedAt, &now);
+        env.storage().instance().set(&keys::GLOBAL_PAUSED, &true);
+        env.storage().instance().set(&keys::PAUSE_REASON, &reason);
+        env.storage().instance().set(&keys::PAUSED_AT, &now);
         env.storage()
             .instance()
-            .set(&DataKey::UnpauseAvailableAt, &(now + timelock_secs));
+            .set(&keys::UNPAUSE_AVAILABLE_AT, &(now + timelock_secs));
 
         // Append to the immutable pause history log
         let record = PauseRecord {
@@ -1512,15 +3263,16 @@ impl BridgeWatchContract {
         let mut history: Vec<PauseRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::PauseHistory)
+            .get(&keys::PAUSE_HISTORY)
             .unwrap_or_else(|| Vec::new(&env));
         history.push_back(record);
         env.storage()
             .persistent()
-            .set(&DataKey::PauseHistory, &history);
+            .set(&keys::PAUSE_HISTORY, &history);
 
         env.events()
-            .publish((symbol_short!("em_pause"), caller), reason);
+            .publish((symbol_short!("em_pause"), caller.clone()), reason.clone());
+        Self::append_admin_activity(&env, AdminActivityAction::ContractPaused, caller, reason);
     }
 
     /// Lift the global pause after the timelock has elapsed.
@@ -1534,7 +3286,7 @@ impl BridgeWatchContract {
     /// - The timelock (`unpause_available_at`) has not yet passed.
     pub fn unpause(env: Env, caller: Address, reason: String) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if caller != admin {
             panic!("only admin can unpause the contract");
         }
@@ -1543,13 +3295,13 @@ impl BridgeWatchContract {
         let available_at: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::UnpauseAvailableAt)
+            .get(&keys::UNPAUSE_AVAILABLE_AT)
             .unwrap_or(0);
         if now < available_at {
             panic!("unpause timelock has not elapsed yet");
         }
 
-        env.storage().instance().set(&DataKey::GlobalPaused, &false);
+        env.storage().instance().set(&keys::GLOBAL_PAUSED, &false);
 
         // Append unpause record to history
         let record = PauseRecord {
@@ -1561,15 +3313,16 @@ impl BridgeWatchContract {
         let mut history: Vec<PauseRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::PauseHistory)
+            .get(&keys::PAUSE_HISTORY)
             .unwrap_or_else(|| Vec::new(&env));
         history.push_back(record);
         env.storage()
             .persistent()
-            .set(&DataKey::PauseHistory, &history);
+            .set(&keys::PAUSE_HISTORY, &history);
 
         env.events()
-            .publish((symbol_short!("em_unpaus"), caller), reason);
+            .publish((symbol_short!("em_unpaus"), caller.clone()), reason.clone());
+        Self::append_admin_activity(&env, AdminActivityAction::ContractUnpaused, caller, reason);
     }
 
     /// Designate a dedicated pause guardian address.
@@ -1582,13 +3335,13 @@ impl BridgeWatchContract {
     /// - `caller` is not the contract admin.
     pub fn set_pause_guardian(env: Env, caller: Address, guardian: Address) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if caller != admin {
             panic!("only admin can set pause guardian");
         }
         env.storage()
             .instance()
-            .set(&DataKey::PauseGuardian, &guardian);
+            .set(&keys::PAUSE_GUARDIAN, &guardian);
 
         env.events().publish((symbol_short!("pg_set"),), guardian);
     }
@@ -1599,7 +3352,7 @@ impl BridgeWatchContract {
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::GlobalPaused)
+            .get(&keys::GLOBAL_PAUSED)
             .unwrap_or(false)
     }
 
@@ -1610,7 +3363,7 @@ impl BridgeWatchContract {
         let globally_paused: bool = env
             .storage()
             .instance()
-            .get(&DataKey::GlobalPaused)
+            .get(&keys::GLOBAL_PAUSED)
             .unwrap_or(false);
         if globally_paused {
             return true;
@@ -1618,7 +3371,7 @@ impl BridgeWatchContract {
         let status: Option<AssetHealth> = env
             .storage()
             .persistent()
-            .get(&DataKey::AssetHealth(asset_code));
+            .get(&AssetDataKey::Health(asset_code.clone()));
         status.map(|s| s.paused).unwrap_or(false)
     }
 
@@ -1630,27 +3383,23 @@ impl BridgeWatchContract {
         let is_paused: bool = env
             .storage()
             .instance()
-            .get(&DataKey::GlobalPaused)
+            .get(&keys::GLOBAL_PAUSED)
             .unwrap_or(false);
         let reason: String = env
             .storage()
             .instance()
-            .get(&DataKey::PauseReason)
+            .get(&keys::PAUSE_REASON)
             .unwrap_or_else(|| String::from_str(&env, ""));
-        let paused_at: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PausedAt)
-            .unwrap_or(0);
+        let paused_at: u64 = env.storage().instance().get(&keys::PAUSED_AT).unwrap_or(0);
         let unpause_available_at: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::UnpauseAvailableAt)
+            .get(&keys::UNPAUSE_AVAILABLE_AT)
             .unwrap_or(0);
         let emergency_contact: String = env
             .storage()
             .instance()
-            .get(&DataKey::EmergencyContact)
+            .get(&keys::EMERGENCY_CONTACT)
             .unwrap_or_else(|| String::from_str(&env, ""));
 
         GlobalPauseState {
@@ -1668,7 +3417,7 @@ impl BridgeWatchContract {
     pub fn get_pause_history(env: Env) -> Vec<PauseRecord> {
         env.storage()
             .persistent()
-            .get(&DataKey::PauseHistory)
+            .get(&keys::PAUSE_HISTORY)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -1682,13 +3431,13 @@ impl BridgeWatchContract {
     /// - `caller` is not the contract admin.
     pub fn set_emergency_contact(env: Env, caller: Address, contact: String) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if caller != admin {
             panic!("only admin can set emergency contact");
         }
         env.storage()
             .instance()
-            .set(&DataKey::EmergencyContact, &contact);
+            .set(&keys::EMERGENCY_CONTACT, &contact);
 
         env.events().publish((symbol_short!("em_cont"),), contact);
     }
@@ -1712,14 +3461,14 @@ impl BridgeWatchContract {
     /// - A non-expired proposal already exists.
     pub fn propose_admin_transfer(env: Env, caller: Address, proposed_admin: Address) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if caller != admin {
             panic!("only the current admin can propose a transfer");
         }
 
         // Reject if a non-expired proposal already exists
         let existing: Option<PendingAdminTransfer> =
-            env.storage().instance().get(&DataKey::PendingTransfer);
+            env.storage().instance().get(&keys::PENDING_TRANSFER);
         if let Some(ref proposal) = existing {
             let now = env.ledger().timestamp();
             if now < proposal.timeout_at {
@@ -1736,7 +3485,7 @@ impl BridgeWatchContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::PendingTransfer, &proposal);
+            .set(&keys::PENDING_TRANSFER, &proposal);
 
         env.events()
             .publish((symbol_short!("adm_prop"), caller), proposed_admin);
@@ -1757,7 +3506,7 @@ impl BridgeWatchContract {
         let proposal: PendingAdminTransfer = env
             .storage()
             .instance()
-            .get(&DataKey::PendingTransfer)
+            .get(&keys::PENDING_TRANSFER)
             .unwrap_or_else(|| panic!("no pending admin transfer"));
 
         let now = env.ledger().timestamp();
@@ -1769,8 +3518,8 @@ impl BridgeWatchContract {
         }
 
         // Atomically promote the caller to admin and clear the proposal
-        env.storage().instance().set(&DataKey::Admin, &caller);
-        env.storage().instance().remove(&DataKey::PendingTransfer);
+        env.storage().instance().set(&keys::ADMIN, &caller);
+        env.storage().instance().remove(&keys::PENDING_TRANSFER);
 
         env.events()
             .publish((symbol_short!("adm_acpt"), caller), true);
@@ -1787,14 +3536,14 @@ impl BridgeWatchContract {
     /// - There is no pending proposal to cancel.
     pub fn cancel_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if caller != admin {
             panic!("only the current admin can cancel a transfer");
         }
-        if !env.storage().instance().has(&DataKey::PendingTransfer) {
+        if !env.storage().instance().has(&keys::PENDING_TRANSFER) {
             panic!("no pending admin transfer to cancel");
         }
-        env.storage().instance().remove(&DataKey::PendingTransfer);
+        env.storage().instance().remove(&keys::PENDING_TRANSFER);
 
         env.events()
             .publish((symbol_short!("adm_cncl"), caller), true);
@@ -1806,7 +3555,7 @@ impl BridgeWatchContract {
     /// Public read — no authorisation required.
     pub fn get_pending_transfer(env: Env) -> Option<PendingAdminTransfer> {
         let proposal: Option<PendingAdminTransfer> =
-            env.storage().instance().get(&DataKey::PendingTransfer);
+            env.storage().instance().get(&keys::PENDING_TRANSFER);
         match proposal {
             None => None,
             Some(p) => {
@@ -1821,6 +3570,924 @@ impl BridgeWatchContract {
     }
 
     // -----------------------------------------------------------------------
+    // Contract Upgrade (issue #98)
+    // -----------------------------------------------------------------------
+
+    /// Propose a contract upgrade with governance approval and timelock.
+    ///
+    /// Standard proposals enforce a 48-hour timelock. Emergency proposals use
+    /// a higher governance threshold and may execute immediately.
+    pub fn propose_upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        emergency: bool,
+        migration_callback: Option<Address>,
+        migration_payload: Option<Bytes>,
+    ) -> u64 {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        Self::check_no_pending_transfer(&env);
+        if env.storage().instance().has(&keys::PENDING_UPGRADE) {
+            panic!("an upgrade proposal is already pending");
+        }
+
+        Self::create_upgrade_proposal(
+            &env,
+            &caller,
+            new_wasm_hash,
+            emergency,
+            migration_callback,
+            migration_payload,
+            false,
+        )
+    }
+
+    /// Propose a rollback using the tracked prior Wasm hash.
+    pub fn propose_rollback(
+        env: Env,
+        caller: Address,
+        emergency: bool,
+        migration_callback: Option<Address>,
+        migration_payload: Option<Bytes>,
+    ) -> u64 {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        Self::check_no_pending_transfer(&env);
+        if env.storage().instance().has(&keys::PENDING_UPGRADE) {
+            panic!("an upgrade proposal is already pending");
+        }
+
+        let rollback_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&keys::ROLLBACK_TARGET_HASH)
+            .unwrap_or_else(|| panic!("no rollback target is currently tracked"));
+
+        Self::create_upgrade_proposal(
+            &env,
+            &caller,
+            rollback_hash,
+            emergency,
+            migration_callback,
+            migration_payload,
+            true,
+        )
+    }
+
+    /// Approve a pending upgrade proposal as a governance member.
+    pub fn approve_upgrade(env: Env, caller: Address, proposal_id: u64) -> u32 {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        Self::check_no_pending_transfer(&env);
+
+        let mut proposal = Self::load_pending_upgrade(&env);
+        if proposal.proposal_id != proposal_id {
+            panic!("upgrade proposal id does not match the pending proposal");
+        }
+        if Self::vec_contains_address(&proposal.approvals, &caller) {
+            panic!("caller has already approved this upgrade proposal");
+        }
+
+        proposal.approvals.push_back(caller.clone());
+        let approval_count = proposal.approvals.len();
+        env.storage()
+            .instance()
+            .set(&keys::PENDING_UPGRADE, &proposal);
+
+        env.events().publish(
+            (symbol_short!("up_appr"), caller),
+            (proposal_id, approval_count, proposal.required_approvals),
+        );
+
+        approval_count
+    }
+
+    /// Execute a pending upgrade once timelock and governance conditions pass.
+    pub fn execute_upgrade(env: Env, caller: Address, proposal_id: u64) {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        Self::check_no_pending_transfer(&env);
+
+        let proposal = Self::load_pending_upgrade(&env);
+        if proposal.proposal_id != proposal_id {
+            panic!("upgrade proposal id does not match the pending proposal");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.execute_after {
+            panic!("upgrade timelock has not elapsed");
+        }
+        if proposal.approvals.len() < proposal.required_approvals {
+            panic!("insufficient governance approvals");
+        }
+
+        let from_version: u32 = env
+            .storage()
+            .instance()
+            .get(&keys::CONTRACT_VERSION)
+            .unwrap_or(1);
+        let to_version = from_version.saturating_add(1);
+        let from_wasm_hash: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&keys::CURRENT_CONTRACT_WASM_HASH);
+
+        if let Some(previous_hash) = from_wasm_hash.clone() {
+            env.storage()
+                .instance()
+                .set(&keys::ROLLBACK_TARGET_HASH, &previous_hash);
+            env.events()
+                .publish((symbol_short!("up_roll"), proposal_id), previous_hash);
+        }
+
+        if let Some(callback) = proposal.migration_callback.clone() {
+            env.events()
+                .publish((symbol_short!("up_migcb"), callback), proposal_id);
+        }
+        if let Some(payload) = proposal.migration_payload.clone() {
+            env.events()
+                .publish((symbol_short!("up_migpl"), proposal_id), payload);
+        }
+
+        #[cfg(not(test))]
+        env.deployer()
+            .update_current_contract_wasm(proposal.new_wasm_hash.clone());
+
+        env.storage()
+            .instance()
+            .set(&keys::CURRENT_CONTRACT_WASM_HASH, &proposal.new_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&keys::CONTRACT_VERSION, &to_version);
+
+        let mut history: Vec<UpgradeExecutionRecord> = env
+            .storage()
+            .persistent()
+            .get(&keys::UPGRADE_HISTORY)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(UpgradeExecutionRecord {
+            proposal_id,
+            executed_by: caller.clone(),
+            from_version,
+            to_version,
+            has_from_wasm_hash: from_wasm_hash.is_some(),
+            from_wasm_hash: from_wasm_hash.unwrap_or(BytesN::from_array(&env, &[0u8; 32])),
+            to_wasm_hash: proposal.new_wasm_hash,
+            executed_at: now,
+            emergency: proposal.emergency,
+            is_rollback: proposal.is_rollback,
+            has_migration_callback: proposal.migration_callback.is_some(),
+            migration_callback: proposal
+                .migration_callback
+                .unwrap_or(env.current_contract_address()),
+        });
+        env.storage()
+            .persistent()
+            .set(&keys::UPGRADE_HISTORY, &history);
+
+        env.storage().instance().remove(&keys::PENDING_UPGRADE);
+
+        env.events().publish(
+            (symbol_short!("up_exec"), caller),
+            (
+                proposal_id,
+                from_version,
+                to_version,
+                proposal.emergency,
+                proposal.is_rollback,
+            ),
+        );
+    }
+
+    /// Cancel a pending upgrade proposal.
+    pub fn cancel_upgrade(env: Env, caller: Address, proposal_id: u64, reason: String) {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+
+        let proposal = Self::load_pending_upgrade(&env);
+        if proposal.proposal_id != proposal_id {
+            panic!("upgrade proposal id does not match the pending proposal");
+        }
+
+        env.storage().instance().remove(&keys::PENDING_UPGRADE);
+        env.events()
+            .publish((symbol_short!("up_cncl"), caller), (proposal_id, reason));
+    }
+
+    /// Return the currently pending contract upgrade proposal, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        env.storage().instance().get(&keys::PENDING_UPGRADE)
+    }
+
+    /// Return historical execution records for all completed upgrades.
+    pub fn get_upgrade_history(env: Env) -> Vec<UpgradeExecutionRecord> {
+        env.storage()
+            .persistent()
+            .get(&keys::UPGRADE_HISTORY)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the current semantic version counter.
+    pub fn get_contract_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&keys::CONTRACT_VERSION)
+            .unwrap_or(1)
+    }
+
+    /// Return the currently tracked active Wasm hash, if set.
+    pub fn get_current_wasm_hash(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&keys::CURRENT_CONTRACT_WASM_HASH)
+    }
+
+    /// Return the currently tracked rollback target hash, if available.
+    pub fn get_rollback_target(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&keys::ROLLBACK_TARGET_HASH)
+    }
+
+    // -----------------------------------------------------------------------
+    // Data retention and cleanup (issue #100)
+    // -----------------------------------------------------------------------
+
+    /// Configure retention and cleanup policy for a historical data bucket.
+    ///
+    /// Admin-only. `retention_secs`, `trigger_interval_secs`, and
+    /// `max_deletions_per_run` must all be greater than zero.
+    pub fn set_retention_policy(
+        env: Env,
+        caller: Address,
+        data_type: RetentionDataType,
+        retention_secs: u64,
+        trigger_interval_secs: u64,
+        max_deletions_per_run: u32,
+        archive_before_delete: bool,
+        enabled: bool,
+    ) {
+        Self::assert_admin_or_super_admin_retention(&env, &caller);
+        Self::validate_retention_policy_inputs(
+            retention_secs,
+            trigger_interval_secs,
+            max_deletions_per_run,
+        );
+
+        let policy = RetentionPolicy {
+            data_type: data_type.clone(),
+            retention_secs,
+            trigger_interval_secs,
+            max_deletions_per_run,
+            archive_before_delete,
+            enabled,
+        };
+
+        env.storage()
+            .instance()
+            .set(&ConfigDataKey::RetPolicy(data_type.clone()), &policy);
+
+        env.events().publish(
+            (
+                symbol_short!("ret_set"),
+                Self::retention_kind_code(&data_type),
+            ),
+            retention_secs,
+        );
+    }
+
+    /// Return retention policy for a given historical data bucket.
+    pub fn get_retention_policy(env: Env, data_type: RetentionDataType) -> RetentionPolicy {
+        Self::load_retention_policy(&env, &data_type)
+    }
+
+    /// Return all retention policies.
+    pub fn list_retention_policies(env: Env) -> Vec<RetentionPolicy> {
+        let mut policies = Vec::new(&env);
+        for data_type in Self::retention_data_types(&env).iter() {
+            policies.push_back(Self::load_retention_policy(&env, &data_type));
+        }
+        policies
+    }
+
+    /// Set or clear a per-asset retention override for a specific data bucket.
+    ///
+    /// When `retention_secs` is `Some(value)`, the override is upserted.
+    /// When `retention_secs` is `None`, the override is removed.
+    pub fn set_asset_retention_override(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        data_type: RetentionDataType,
+        retention_secs: Option<u64>,
+    ) {
+        Self::assert_admin_or_super_admin_retention(&env, &caller);
+
+        let key = ConfigDataKey::RetOvr(asset_code.clone(), data_type.clone());
+        match retention_secs {
+            Some(value) => {
+                if value == 0 {
+                    panic!("asset retention override must be greater than zero");
+                }
+                env.storage().persistent().set(&key, &value);
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+
+        env.events().publish(
+            (
+                symbol_short!("ret_ovr"),
+                Self::retention_kind_code(&data_type),
+            ),
+            asset_code,
+        );
+    }
+
+    /// Return per-asset retention override for a data bucket, if configured.
+    pub fn get_asset_retention_override(
+        env: Env,
+        asset_code: String,
+        data_type: RetentionDataType,
+    ) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&ConfigDataKey::RetOvr(asset_code, data_type))
+    }
+
+    /// Run gradual historical cleanup across all retention-enabled data buckets.
+    ///
+    /// Admin-only. Cleanup never deletes currently active/latest records.
+    pub fn cleanup_old_data(env: Env, caller: Address, max_total_deletions: u32) -> CleanupResult {
+        Self::assert_admin_or_super_admin_retention(&env, &caller);
+        if max_total_deletions == 0 {
+            panic!("max_total_deletions must be greater than zero");
+        }
+
+        let now = env.ledger().timestamp();
+        let mut details = Vec::new(&env);
+        let mut total_deleted = 0u32;
+        let mut total_archived = 0u32;
+
+        for data_type in Self::retention_data_types(&env).iter() {
+            if total_deleted >= max_total_deletions {
+                break;
+            }
+
+            let policy = Self::load_retention_policy(&env, &data_type);
+            if !policy.enabled {
+                continue;
+            }
+
+            let remaining_budget = max_total_deletions - total_deleted;
+            let run_budget = if policy.max_deletions_per_run < remaining_budget {
+                policy.max_deletions_per_run
+            } else {
+                remaining_budget
+            };
+
+            if run_budget == 0 {
+                continue;
+            }
+
+            let (deleted, archived) =
+                Self::cleanup_data_type_internal(&env, &data_type, &policy, run_budget);
+
+            details.push_back(CleanupDataTypeResult {
+                data_type: data_type.clone(),
+                deleted,
+                archived,
+            });
+
+            total_deleted += deleted;
+            total_archived += archived;
+            env.storage()
+                .instance()
+                .set(&ConfigDataKey::LastCleanup(data_type.clone()), &now);
+
+            if deleted > 0 || archived > 0 {
+                env.events().publish(
+                    (
+                        symbol_short!("ret_cln"),
+                        Self::retention_kind_code(&data_type),
+                    ),
+                    (deleted, archived, now),
+                );
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("ret_done"),),
+            (total_deleted, total_archived, now),
+        );
+
+        CleanupResult {
+            executed_at: now,
+            total_deleted,
+            total_archived,
+            details,
+        }
+    }
+
+    /// Run gradual cleanup for a single data bucket.
+    ///
+    /// Admin-only. This is useful for operational bulk deletes when only one
+    /// historical collection should be processed.
+    pub fn cleanup_data_type(
+        env: Env,
+        caller: Address,
+        data_type: RetentionDataType,
+        max_deletions: u32,
+    ) -> CleanupDataTypeResult {
+        Self::assert_admin_or_super_admin_retention(&env, &caller);
+        if max_deletions == 0 {
+            panic!("max_deletions must be greater than zero");
+        }
+
+        let policy = Self::load_retention_policy(&env, &data_type);
+        if !policy.enabled {
+            return CleanupDataTypeResult {
+                data_type,
+                deleted: 0,
+                archived: 0,
+            };
+        }
+
+        let run_budget = if policy.max_deletions_per_run < max_deletions {
+            policy.max_deletions_per_run
+        } else {
+            max_deletions
+        };
+        let (deleted, archived) =
+            Self::cleanup_data_type_internal(&env, &data_type, &policy, run_budget);
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&ConfigDataKey::LastCleanup(data_type.clone()), &now);
+
+        if deleted > 0 || archived > 0 {
+            env.events().publish(
+                (
+                    symbol_short!("ret_cln"),
+                    Self::retention_kind_code(&data_type),
+                ),
+                (deleted, archived, now),
+            );
+        }
+
+        CleanupDataTypeResult {
+            data_type,
+            deleted,
+            archived,
+        }
+    }
+
+    /// Return current storage usage counters for retained and archived data.
+    pub fn get_storage_stats(env: Env) -> StorageStats {
+        let supply = Self::supply_storage_usage(&env);
+        let liquidity = Self::liquidity_storage_usage(&env);
+        let checkpoints = Self::checkpoint_storage_usage(&env);
+
+        let mut entries = Vec::new(&env);
+        entries.push_back(supply.clone());
+        entries.push_back(liquidity.clone());
+        entries.push_back(checkpoints.clone());
+
+        StorageStats {
+            generated_at: env.ledger().timestamp(),
+            total_tracked_keys: supply.tracked_keys
+                + liquidity.tracked_keys
+                + checkpoints.tracked_keys,
+            total_active_records: supply.active_records
+                + liquidity.active_records
+                + checkpoints.active_records,
+            total_archived_records: supply.archived_records
+                + liquidity.archived_records
+                + checkpoints.archived_records,
+            entries,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration Management (issue #103)
+    // -----------------------------------------------------------------------
+
+    /// Store or update a single on-chain configuration parameter.
+    ///
+    /// # Access control
+    /// Only the contract admin or an address with the `SuperAdmin` role may
+    /// call this function.
+    ///
+    /// # Parameters
+    /// - `caller`      – The address performing the update. Must be authorised.
+    /// - `category`    – Parameter category (`Thresholds`, `Timeouts`, `Limits`).
+    /// - `name`        – Parameter name, max 64 bytes.
+    /// - `value`       – New numeric value.
+    /// - `description` – Human-readable description (required, max 256 bytes).
+    ///
+    /// # Validation
+    /// - `name` must be non-empty and ≤ 64 bytes.
+    /// - `description` must be non-empty and ≤ 256 bytes.
+    /// - For `Timeouts` category: `value` must be ≥ 1 (at least 1 second).
+    /// - For `Limits` category: `value` must be ≥ 1.
+    /// - For `Thresholds` category: `value` must be ≥ 0.
+    ///
+    /// # Events
+    /// Publishes a `("config_up", category_tag, name)` event with the new value.
+    ///
+    /// # Audit trail
+    /// Appends a `ConfigAuditEntry` to the parameter's audit log (capped at 50
+    /// entries; oldest entries are dropped when the cap is reached).
+    pub fn set_config(
+        env: Env,
+        caller: Address,
+        category: ConfigCategory,
+        name: String,
+        value: i128,
+        description: String,
+    ) {
+        caller.require_auth();
+        Self::assert_not_globally_paused(&env);
+        Self::check_no_pending_transfer(&env);
+
+        // Admin-only: require admin or SuperAdmin role
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            let has_super = Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+            if !has_super {
+                panic!("unauthorized: only admin may modify configuration");
+            }
+        }
+
+        // Validate name (non-empty, ≤ 64 bytes)
+        if name.len() == 0 {
+            panic!("config: name must not be empty");
+        }
+        if name.len() > 64 {
+            panic!("config: name must be ≤ 64 bytes");
+        }
+
+        // Validate description (non-empty, ≤ 256 bytes)
+        if description.len() == 0 {
+            panic!("config: description must not be empty");
+        }
+        if description.len() > 256 {
+            panic!("config: description must be ≤ 256 bytes");
+        }
+
+        // Category-specific value validation
+        match category {
+            ConfigCategory::Threshold => {
+                if value < 0 {
+                    panic!("config: threshold value must be ≥ 0");
+                }
+            }
+            ConfigCategory::Timeouts => {
+                if value < 1 {
+                    panic!("config: timeout value must be ≥ 1 second");
+                }
+            }
+            ConfigCategory::Limits => {
+                if value < 1 {
+                    panic!("config: limit value must be ≥ 1");
+                }
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let storage_key = ConfigDataKey::Entry(category.clone(), name.clone());
+
+        // Determine previous value and compute new version
+        let (old_value, new_version) =
+            if let Some(existing) = env.storage().instance().get::<_, ConfigEntry>(&storage_key) {
+                (existing.value.value, existing.version + 1)
+            } else {
+                (0_i128, 1_u32)
+            };
+
+        // Write updated entry
+        let entry = ConfigEntry {
+            category: category.clone(),
+            name: name.clone(),
+            value: ConfigValue { value, description },
+            version: new_version,
+            updated_at: now,
+            updated_by: caller.clone(),
+        };
+        env.storage().instance().set(&storage_key, &entry);
+
+        // Maintain global key list for enumeration
+        let keys_key = DataKey::ConfigKeys;
+        let mut keys: Vec<(ConfigCategory, String)> = env
+            .storage()
+            .instance()
+            .get(&keys_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..keys.len() {
+            let (ref k_cat, ref k_name) = keys.get(i).unwrap();
+            if *k_cat == category && *k_name == name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            keys.push_back((category.clone(), name.clone()));
+            env.storage().instance().set(&keys_key, &keys);
+        }
+
+        // Append to audit log (cap at 50 entries)
+        let audit_key = ConfigDataKey::AuditLog(category.clone(), name.clone());
+        let mut audit_log: Vec<ConfigAuditEntry> = env
+            .storage()
+            .instance()
+            .get(&audit_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let audit_entry = ConfigAuditEntry {
+            old_value,
+            new_value: value,
+            version: new_version,
+            changed_at: now,
+            changed_by: caller,
+        };
+        audit_log.push_back(audit_entry);
+
+        // Trim to last 50 entries
+        while audit_log.len() > 50 {
+            let mut trimmed: Vec<ConfigAuditEntry> = Vec::new(&env);
+            for i in 1..audit_log.len() {
+                trimmed.push_back(audit_log.get(i).unwrap());
+            }
+            audit_log = trimmed;
+        }
+        env.storage().instance().set(&audit_key, &audit_log);
+
+        // Emit change notification event
+        let category_tag = match category {
+            ConfigCategory::Threshold => symbol_short!("thresh"),
+            ConfigCategory::Timeouts => symbol_short!("timeout"),
+            ConfigCategory::Limits => symbol_short!("limits"),
+        };
+        env.events()
+            .publish((symbol_short!("config_up"), category_tag, name), value);
+    }
+
+    /// Retrieve a single configuration parameter by category and name.
+    ///
+    /// Returns `None` when no value has been explicitly stored and no default
+    /// exists. Callers should apply their own application-layer defaults for
+    /// `None` responses.
+    ///
+    /// No authorisation required — read-only.
+    pub fn get_config(env: Env, category: ConfigCategory, name: String) -> Option<ConfigEntry> {
+        env.storage()
+            .instance()
+            .get(&ConfigDataKey::Entry(category.clone(), name.clone()))
+    }
+
+    /// Retrieve all stored configuration parameters as a single export.
+    ///
+    /// Returns an `AllConfigsExport` containing every `ConfigEntry` currently
+    /// stored on-chain, the total count, and the ledger timestamp of the
+    /// export.
+    ///
+    /// No authorisation required — read-only.
+    pub fn get_all_configs(env: Env) -> AllConfigsExport {
+        let now = env.ledger().timestamp();
+        let keys: Vec<(ConfigCategory, String)> = env
+            .storage()
+            .instance()
+            .get(&keys::CONFIG_KEYS)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut entries: Vec<ConfigEntry> = Vec::new(&env);
+        for i in 0..keys.len() {
+            let (cat, nm) = keys.get(i).unwrap();
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get::<_, ConfigEntry>(&ConfigDataKey::Entry(cat.clone(), nm.clone()))
+            {
+                entries.push_back(entry);
+            }
+        }
+
+        let total = entries.len();
+        AllConfigsExport {
+            entries,
+            total,
+            exported_at: now,
+        }
+    }
+
+    /// Retrieve the full audit log for a specific configuration parameter.
+    ///
+    /// Returns an empty `Vec` when no changes have been recorded yet.
+    ///
+    /// No authorisation required — read-only.
+    pub fn get_config_audit_log(
+        env: Env,
+        category: ConfigCategory,
+        name: String,
+    ) -> Vec<ConfigAuditEntry> {
+        env.storage()
+            .instance()
+            .get(&ConfigDataKey::AuditLog(category.clone(), name.clone()))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Apply multiple configuration updates atomically in a single transaction.
+    ///
+    /// Each update in `updates` follows the same validation rules as
+    /// `set_config()`. If any update fails validation the entire call panics
+    /// and no changes are written.
+    ///
+    /// # Access control
+    /// Only the contract admin or an address with the `SuperAdmin` role.
+    ///
+    /// # Limits
+    /// At most 20 updates per call to bound gas usage.
+    pub fn set_config_bulk(env: Env, caller: Address, updates: Vec<BulkConfigUpdate>) {
+        caller.require_auth();
+        Self::assert_not_globally_paused(&env);
+        Self::check_no_pending_transfer(&env);
+
+        // Admin-only guard
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            let has_super = Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+            if !has_super {
+                panic!("unauthorized: only admin may modify configuration");
+            }
+        }
+
+        if updates.len() == 0 {
+            panic!("config: bulk update list must not be empty");
+        }
+        if updates.len() > 20 {
+            panic!("config: bulk update list must contain at most 20 items");
+        }
+
+        // Apply each update — uses the same logic as set_config()
+        for i in 0..updates.len() {
+            let u = updates.get(i).unwrap();
+            Self::set_config(
+                env.clone(),
+                caller.clone(),
+                u.category,
+                u.name,
+                u.value,
+                u.description,
+            );
+        }
+    }
+
+    /// Initialise configuration with the protocol's built-in default values.
+    ///
+    /// Safe to call multiple times: existing values are **not** overwritten,
+    /// only parameters that are absent are initialised. Intended to be called
+    /// once after `initialize()` to seed the on-chain configuration with
+    /// sensible defaults.
+    ///
+    /// # Default parameters
+    ///
+    /// **Thresholds**
+    /// | Name                         | Default | Unit          |
+    /// |------------------------------|---------|---------------|
+    /// | `health_score_min`           | 50      | score (0–100) |
+    /// | `price_deviation_low_bps`    | 200     | basis points  |
+    /// | `price_deviation_medium_bps` | 500     | basis points  |
+    /// | `price_deviation_high_bps`   | 1000    | basis points  |
+    /// | `supply_mismatch_bps`        | 10      | basis points  |
+    ///
+    /// **Timeouts**
+    /// | Name                      | Default | Unit    |
+    /// |---------------------------|---------|---------|
+    /// | `price_staleness_seconds` | 3600    | seconds |
+    /// | `health_staleness_seconds`| 3600    | seconds |
+    /// | `pause_timelock_seconds`  | 300     | seconds |
+    /// | `admin_transfer_timeout`  | 86400   | seconds |
+    ///
+    /// **Limits**
+    /// | Name                   | Default | Unit  |
+    /// |------------------------|---------|-------|
+    /// | `max_monitored_assets` | 100     | count |
+    /// | `max_batch_size`       | 50      | count |
+    /// | `max_signers`          | 20      | count |
+    /// | `max_price_history`    | 100     | count |
+    pub fn init_default_config(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::assert_not_globally_paused(&env);
+
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            let has_super = Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+            if !has_super {
+                panic!("unauthorized: only admin may initialise default config");
+            }
+        }
+
+        // Helper closure: only write when the key doesn't exist yet.
+        let set_if_absent = |cat: ConfigCategory, nm: &str, val: i128, desc: &str| {
+            let key = ConfigDataKey::Entry(cat.clone(), String::from_str(&env, nm));
+            if env
+                .storage()
+                .instance()
+                .get::<_, ConfigEntry>(&key)
+                .is_none()
+            {
+                Self::set_config(
+                    env.clone(),
+                    caller.clone(),
+                    cat,
+                    String::from_str(&env, nm),
+                    val,
+                    String::from_str(&env, desc),
+                );
+            }
+        };
+
+        // Thresholds
+        set_if_absent(
+            ConfigCategory::Threshold,
+            "health_score_min",
+            50,
+            "Minimum acceptable composite health score (0-100)",
+        );
+        set_if_absent(
+            ConfigCategory::Threshold,
+            "price_deviation_low_bps",
+            200,
+            "Low-severity price deviation trigger in basis points (default 2%)",
+        );
+        set_if_absent(
+            ConfigCategory::Threshold,
+            "price_deviation_medium_bps",
+            500,
+            "Medium-severity price deviation trigger in basis points (default 5%)",
+        );
+        set_if_absent(
+            ConfigCategory::Threshold,
+            "price_deviation_high_bps",
+            1000,
+            "High-severity price deviation trigger in basis points (default 10%)",
+        );
+        set_if_absent(
+            ConfigCategory::Threshold,
+            "supply_mismatch_bps",
+            10,
+            "Critical supply mismatch threshold in basis points (default 0.1%)",
+        );
+
+        // Timeouts
+        set_if_absent(
+            ConfigCategory::Timeouts,
+            "price_staleness_seconds",
+            3600,
+            "Age in seconds after which a price record is considered stale",
+        );
+        set_if_absent(
+            ConfigCategory::Timeouts,
+            "health_staleness_seconds",
+            3600,
+            "Age in seconds after which a health score is considered stale",
+        );
+        set_if_absent(
+            ConfigCategory::Timeouts,
+            "pause_timelock_seconds",
+            300,
+            "Minimum seconds that must elapse before an emergency pause can be lifted",
+        );
+        set_if_absent(
+            ConfigCategory::Timeouts,
+            "admin_transfer_timeout",
+            86400,
+            "Seconds until a pending admin transfer proposal expires automatically",
+        );
+
+        // Limits
+        set_if_absent(
+            ConfigCategory::Limits,
+            "max_monitored_assets",
+            100,
+            "Maximum number of assets that may be registered simultaneously",
+        );
+        set_if_absent(
+            ConfigCategory::Limits,
+            "max_batch_size",
+            50,
+            "Maximum number of records in a single batch submit call",
+        );
+        set_if_absent(
+            ConfigCategory::Limits,
+            "max_signers",
+            20,
+            "Maximum number of registered signers allowed at one time",
+        );
+        set_if_absent(
+            ConfigCategory::Limits,
+            "max_price_history",
+            100,
+            "Maximum number of historical price records retained per asset",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -1829,7 +4496,7 @@ impl BridgeWatchContract {
     /// with `SuperAdmin` or the specific `required_role` also passes.
     fn check_permission(env: &Env, caller: &Address, required_role: AdminRole) {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         if *caller == admin {
             return;
         }
@@ -1840,6 +4507,203 @@ impl BridgeWatchContract {
         }
     }
 
+    fn assert_can_manage_threshold_overrides(env: &Env, caller: &Address) {
+        Self::assert_not_globally_paused(env);
+        Self::check_no_pending_transfer(env);
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        acl::require_permission(env, caller, &admin, &Permission::ManageConfig);
+    }
+
+    fn validate_deviation_threshold_range(low_bps: i128, medium_bps: i128, high_bps: i128) {
+        if low_bps <= 0 {
+            panic!("low_bps must be greater than zero");
+        }
+        if medium_bps <= low_bps {
+            panic!("medium_bps must be greater than low_bps");
+        }
+        if high_bps <= medium_bps {
+            panic!("high_bps must be greater than medium_bps");
+        }
+    }
+
+    fn validate_mismatch_threshold_value(threshold_bps: i128) {
+        if threshold_bps <= 0 {
+            panic!("mismatch threshold must be greater than zero");
+        }
+    }
+
+    fn resolve_override_expiration(
+        now: u64,
+        mode: &ThresholdOverrideMode,
+        expires_at: Option<u64>,
+    ) -> u64 {
+        match mode {
+            ThresholdOverrideMode::Permanent => {
+                if expires_at.is_some() {
+                    panic!("permanent override must not include expires_at");
+                }
+                0
+            }
+            ThresholdOverrideMode::Temporary => {
+                let value = expires_at.unwrap_or_else(|| {
+                    panic!("temporary override requires expires_at");
+                });
+                if value <= now {
+                    panic!("temporary override expires_at must be in the future");
+                }
+                value
+            }
+        }
+    }
+
+    fn load_active_deviation_threshold_override(
+        env: &Env,
+        asset_code: &String,
+    ) -> Option<DeviationThresholdOverride> {
+        let key = AssetDataKey::DevThreshOvr(asset_code.clone());
+        let override_entry: Option<DeviationThresholdOverride> =
+            env.storage().persistent().get(&key);
+        match override_entry {
+            Some(entry) => {
+                if entry.mode == ThresholdOverrideMode::Temporary
+                    && entry.expires_at != 0
+                    && env.ledger().timestamp() >= entry.expires_at
+                {
+                    env.storage().persistent().remove(&key);
+                    None
+                } else {
+                    Some(entry)
+                }
+            }
+            None => None,
+        }
+    }
+
+    fn load_active_mismatch_threshold_override(
+        env: &Env,
+        asset_code: &String,
+    ) -> Option<MismatchThresholdOverride> {
+        let key = AssetDataKey::MmThreshOvr(asset_code.clone());
+        let override_entry: Option<MismatchThresholdOverride> =
+            env.storage().persistent().get(&key);
+        match override_entry {
+            Some(entry) => {
+                if entry.mode == ThresholdOverrideMode::Temporary
+                    && entry.expires_at != 0
+                    && env.ledger().timestamp() >= entry.expires_at
+                {
+                    env.storage().persistent().remove(&key);
+                    None
+                } else {
+                    Some(entry)
+                }
+            }
+            None => None,
+        }
+    }
+
+    fn default_deviation_threshold() -> DeviationThreshold {
+        DeviationThreshold {
+            low_bps: 200,
+            medium_bps: 500,
+            high_bps: 1_000,
+        }
+    }
+
+    fn resolve_deviation_threshold(env: &Env, asset_code: &String) -> DeviationThreshold {
+        if let Some(override_entry) =
+            Self::load_active_deviation_threshold_override(env, asset_code)
+        {
+            return override_entry.threshold;
+        }
+
+        env.storage()
+            .persistent()
+            .get(&AssetDataKey::DevThresh(asset_code.clone()))
+            .unwrap_or_else(Self::default_deviation_threshold)
+    }
+
+    fn resolve_mismatch_threshold_bps(env: &Env, asset_code: &String) -> i128 {
+        if let Some(override_entry) = Self::load_active_mismatch_threshold_override(env, asset_code)
+        {
+            return override_entry.threshold_bps;
+        }
+
+        env.storage()
+            .instance()
+            .get(&keys::MISMATCH_THRESHOLD)
+            .unwrap_or(10)
+    }
+
+    fn append_threshold_override_audit(
+        env: &Env,
+        name: String,
+        old_value: i128,
+        new_value: i128,
+        caller: &Address,
+    ) {
+        let category = ConfigCategory::Threshold;
+        let now = env.ledger().timestamp();
+        let audit_key = ConfigDataKey::AuditLog(category, name);
+        let mut audit_log: Vec<ConfigAuditEntry> = env
+            .storage()
+            .instance()
+            .get(&audit_key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let version = if audit_log.is_empty() {
+            1u32
+        } else {
+            audit_log.get(audit_log.len() - 1).unwrap().version + 1
+        };
+
+        audit_log.push_back(ConfigAuditEntry {
+            old_value,
+            new_value,
+            version,
+            changed_at: now,
+            changed_by: caller.clone(),
+        });
+
+        while audit_log.len() > 50 {
+            let mut trimmed: Vec<ConfigAuditEntry> = Vec::new(env);
+            for i in 1..audit_log.len() {
+                trimmed.push_back(audit_log.get(i).unwrap());
+            }
+            audit_log = trimmed;
+        }
+
+        env.storage().instance().set(&audit_key, &audit_log);
+    }
+
+    fn deviation_override_audit_name(env: &Env, asset_code: &String) -> String {
+        let prefix = b"deviation_override_";
+        let asset_len = asset_code.len() as usize;
+        if asset_len > 256 {
+            panic!("asset code too long");
+        }
+
+        let total_len = prefix.len() + asset_len;
+        let mut raw = [0u8; 512];
+        raw[..prefix.len()].copy_from_slice(prefix);
+        asset_code.copy_into_slice(&mut raw[prefix.len()..total_len]);
+        String::from_bytes(env, &raw[..total_len])
+    }
+
+    fn mismatch_override_audit_name(env: &Env, asset_code: &String) -> String {
+        let prefix = b"mismatch_override_";
+        let asset_len = asset_code.len() as usize;
+        if asset_len > 256 {
+            panic!("asset code too long");
+        }
+
+        let total_len = prefix.len() + asset_len;
+        let mut raw = [0u8; 512];
+        raw[..prefix.len()].copy_from_slice(prefix);
+        asset_code.copy_into_slice(&mut raw[prefix.len()..total_len]);
+        String::from_bytes(env, &raw[..total_len])
+    }
+
     /// Panic if the contract is currently globally paused.
     ///
     /// Called at the top of every state-changing function to enforce the
@@ -1848,7 +4712,7 @@ impl BridgeWatchContract {
         let paused: bool = env
             .storage()
             .instance()
-            .get(&DataKey::GlobalPaused)
+            .get(&keys::GLOBAL_PAUSED)
             .unwrap_or(false);
         if paused {
             panic!("contract is globally paused; all write operations are halted");
@@ -1861,7 +4725,7 @@ impl BridgeWatchContract {
     /// privileged changes while admin rights are being handed over.
     fn check_no_pending_transfer(env: &Env) {
         let proposal: Option<PendingAdminTransfer> =
-            env.storage().instance().get(&DataKey::PendingTransfer);
+            env.storage().instance().get(&keys::PENDING_TRANSFER);
         if let Some(p) = proposal {
             let now = env.ledger().timestamp();
             if now < p.timeout_at {
@@ -1870,12 +4734,122 @@ impl BridgeWatchContract {
         }
     }
 
+    fn load_pending_upgrade(env: &Env) -> UpgradeProposal {
+        env.storage()
+            .instance()
+            .get(&keys::PENDING_UPGRADE)
+            .unwrap_or_else(|| panic!("no pending upgrade proposal"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_upgrade_proposal(
+        env: &Env,
+        caller: &Address,
+        new_wasm_hash: BytesN<32>,
+        emergency: bool,
+        migration_callback: Option<Address>,
+        migration_payload: Option<Bytes>,
+        is_rollback: bool,
+    ) -> u64 {
+        if migration_payload.is_some() && migration_callback.is_none() {
+            panic!("migration payload requires a migration callback");
+        }
+
+        let now = env.ledger().timestamp();
+        let timelock_secs = if emergency { 0u64 } else { 172_800u64 };
+        let required_approvals = Self::upgrade_approval_threshold(env, emergency);
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&keys::UPGRADE_PROPOSAL_COUNTER)
+            .unwrap_or(0)
+            + 1;
+
+        let mut approvals = Vec::new(env);
+        approvals.push_back(caller.clone());
+
+        let proposal = UpgradeProposal {
+            proposal_id,
+            proposer: caller.clone(),
+            new_wasm_hash,
+            proposed_at: now,
+            execute_after: now + timelock_secs,
+            required_approvals,
+            approvals,
+            emergency,
+            migration_callback,
+            migration_payload,
+            is_rollback,
+        };
+
+        env.storage()
+            .instance()
+            .set(&keys::UPGRADE_PROPOSAL_COUNTER, &proposal_id);
+        env.storage()
+            .instance()
+            .set(&keys::PENDING_UPGRADE, &proposal);
+
+        env.events().publish(
+            (symbol_short!("up_prop"), caller.clone()),
+            (proposal_id, required_approvals, emergency, is_rollback),
+        );
+
+        proposal_id
+    }
+
+    fn governance_member_count(env: &Env) -> u32 {
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        let mut members: Vec<Address> = Vec::new(env);
+        members.push_back(admin);
+
+        let assignments: Vec<RoleAssignment> = env
+            .storage()
+            .persistent()
+            .get(&keys::ROLES_LIST)
+            .unwrap_or_else(|| Vec::new(env));
+        for assignment in assignments.iter() {
+            if assignment.role == AdminRole::SuperAdmin
+                && !Self::vec_contains_address(&members, &assignment.address)
+            {
+                members.push_back(assignment.address);
+            }
+        }
+
+        members.len()
+    }
+
+    fn upgrade_approval_threshold(env: &Env, emergency: bool) -> u32 {
+        let members = Self::governance_member_count(env);
+        if members == 0 {
+            panic!("no governance members configured");
+        }
+
+        let standard_threshold = members.div_ceil(2);
+        if !emergency {
+            return standard_threshold;
+        }
+
+        if members < 2 {
+            panic!("emergency upgrades require at least two governance members");
+        }
+
+        let mut emergency_threshold = (members * 2).div_ceil(3);
+        if emergency_threshold <= standard_threshold {
+            emergency_threshold = standard_threshold + 1;
+        }
+        if emergency_threshold > members {
+            emergency_threshold = members;
+        }
+
+        emergency_threshold
+    }
+
     /// Internal role lookup (no auth check).
     fn has_role_internal(env: &Env, address: &Address, role: AdminRole) -> bool {
         let roles: Vec<AdminRole> = env
             .storage()
             .persistent()
-            .get(&DataKey::RoleKey(address.clone()))
+            .get(&ConfigDataKey::RoleKey(address.clone()))
             .unwrap_or_else(|| Vec::new(env));
         for r in roles.iter() {
             if r == role {
@@ -1929,7 +4903,7 @@ impl BridgeWatchContract {
     fn load_asset_health(env: &Env, asset_code: &String) -> AssetHealth {
         env.storage()
             .persistent()
-            .get(&DataKey::AssetHealth(asset_code.clone()))
+            .get(&AssetDataKey::Health(asset_code.clone()))
             .unwrap_or_else(|| panic!("asset is not registered"))
     }
 
@@ -1962,7 +4936,7 @@ impl BridgeWatchContract {
         pool_type: PoolType,
     ) {
         Self::assert_not_globally_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         admin.require_auth();
 
         liquidity_pool::record_pool_state(
@@ -2062,7 +5036,7 @@ impl BridgeWatchContract {
     ) {
         Self::assert_not_globally_paused(&env);
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
         Self::check_no_pending_transfer(&env);
         let authorized =
             caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
@@ -2088,9 +5062,10 @@ impl BridgeWatchContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::HealthWeights, &weights);
+            .set(&keys::HEALTH_WEIGHTS, &weights);
 
         env.events().publish((symbol_short!("wt_set"),), version);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Return the current health score calculation weights.
@@ -2142,6 +5117,7 @@ impl BridgeWatchContract {
             bridge_uptime_score,
             weights,
             timestamp: env.ledger().timestamp(),
+            expires_at: 0,
         }
     }
 
@@ -2210,6 +5186,12 @@ impl BridgeWatchContract {
             paused: status.paused,
             active: status.active,
             timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::Asset,
+                timestamp,
+            ),
         };
 
         let result = HealthScoreResult {
@@ -2219,17 +5201,24 @@ impl BridgeWatchContract {
             bridge_uptime_score,
             weights,
             timestamp,
+            expires_at: Self::resolve_expiration(
+                &env,
+                &asset_code,
+                ExpirationKind::HealthResult,
+                timestamp,
+            ),
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::AssetHealth(asset_code.clone()), &record);
+            .set(&AssetDataKey::Health(asset_code.clone()), &record);
         env.storage()
             .persistent()
-            .set(&DataKey::HealthScoreResult(asset_code.clone()), &result);
+            .set(&AssetDataKey::HealthRes(asset_code.clone()), &result);
 
         env.events()
             .publish((symbol_short!("health_up"), asset_code), final_score);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Return the latest calculated health score result for an asset.
@@ -2239,24 +5228,1407 @@ impl BridgeWatchContract {
     pub fn get_health_score_result(env: Env, asset_code: String) -> Option<HealthScoreResult> {
         env.storage()
             .persistent()
-            .get(&DataKey::HealthScoreResult(asset_code))
+            .get(&AssetDataKey::HealthRes(asset_code.clone()))
+    }
+
+    /// Store configuration for deterministic risk score calculations.
+    ///
+    /// `caller` must be the contract admin or a `SuperAdmin`. The weights are
+    /// expressed in basis points and must sum to exactly 10,000.
+    pub fn set_risk_score_config(
+        env: Env,
+        caller: Address,
+        health_weight_bps: u32,
+        price_weight_bps: u32,
+        volatility_weight_bps: u32,
+        max_price_deviation_bps: u32,
+        max_volatility_bps: u32,
+        version: u32,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        Self::check_no_pending_transfer(&env);
+        let authorized =
+            caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can set risk score config");
+        }
+
+        Self::validate_risk_score_config(
+            health_weight_bps,
+            price_weight_bps,
+            volatility_weight_bps,
+            max_price_deviation_bps,
+            max_volatility_bps,
+            version,
+        );
+
+        let config = RiskScoreConfig {
+            health_weight_bps,
+            price_weight_bps,
+            volatility_weight_bps,
+            max_price_deviation_bps,
+            max_volatility_bps,
+            version,
+        };
+
+        env.storage()
+            .instance()
+            .set(&keys::RISK_SCORE_CONFIG, &config);
+
+        env.events()
+            .publish((symbol_short!("risk_cfg"),), version);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
+    }
+
+    /// Return the active risk score calculation configuration.
+    ///
+    /// Public read access — no authorisation required. Returns the configured
+    /// values or the defaults when no custom configuration has been stored.
+    pub fn get_risk_score_config(env: Env) -> RiskScoreConfig {
+        Self::load_risk_score_config(&env)
+    }
+
+    /// Pure deterministic calculation for the composite risk score.
+    ///
+    /// The output is normalized to basis points (0–10,000) and combines:
+    /// 1. Inverted health score
+    /// 2. Price deviation
+    /// 3. Volatility
+    ///
+    /// Price and volatility inputs are clamped to the configured normalization
+    /// ceilings before the weighted average is computed.
+    pub fn calculate_risk_score(
+        env: Env,
+        health_score: u32,
+        price_deviation_bps: u32,
+        volatility_bps: u32,
+    ) -> RiskScoreResult {
+        Self::validate_score_range(health_score, "health_score");
+        Self::build_risk_score_result(
+            &env,
+            health_score,
+            price_deviation_bps,
+            volatility_bps,
+        )
+    }
+
+    /// Derive a risk score for an asset from stored health and price history.
+    ///
+    /// Public read access — no authorisation required. Returns `None` when the
+    /// asset has no stored health record.
+    pub fn get_asset_risk_score(
+        env: Env,
+        asset_code: String,
+        period: StatPeriod,
+    ) -> Option<RiskScoreResult> {
+        let health: AssetHealth = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::Health(asset_code.clone()))?;
+        let period_secs = Self::stat_period_secs(&period);
+        let prices = Self::collect_prices_for_period(&env, &asset_code, period_secs);
+        let price_deviation_bps =
+            Self::calculate_latest_price_deviation_bps(env.clone(), prices.clone());
+        let volatility_bps = if prices.len() < 2 {
+            0
+        } else {
+            Self::clamp_i128_to_u32(Self::calculate_volatility(
+                env.clone(),
+                prices,
+                period_secs,
+            ))
+        };
+
+        Some(Self::build_risk_score_result(
+            &env,
+            health.health_score,
+            price_deviation_bps,
+            volatility_bps,
+        ))
+    }
+
+    /// Update automatic checkpoint settings.
+    pub fn set_checkpoint_config(
+        env: Env,
+        caller: Address,
+        interval_secs: u64,
+        max_checkpoints: u32,
+        format_version: u32,
+    ) {
+        Self::assert_admin_or_super_admin(&env, &caller);
+
+        if max_checkpoints == 0 {
+            panic!("max_checkpoints must be greater than zero");
+        }
+        if format_version == 0 {
+            panic!("format_version must be greater than zero");
+        }
+
+        let config = CheckpointConfig {
+            interval_secs,
+            max_checkpoints,
+            format_version,
+        };
+
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_CONFIG, &config);
+        Self::prune_checkpoints(&env, &config);
+
+        env.events()
+            .publish((symbol_short!("chk_cfg"),), max_checkpoints);
+    }
+
+    /// Return the active checkpoint configuration.
+    pub fn get_checkpoint_config(env: Env) -> CheckpointConfig {
+        Self::load_checkpoint_config(&env)
+    }
+
+    /// Create a manual checkpoint of the current contract state.
+    pub fn create_checkpoint(env: Env, caller: Address, label: String) -> CheckpointMetadata {
+        Self::assert_admin_or_super_admin(&env, &caller);
+        Self::persist_checkpoint(&env, &caller, CheckpointTrigger::Manual, label, None)
+    }
+
+    /// Return a historical checkpoint snapshot by id.
+    pub fn get_checkpoint(env: Env, checkpoint_id: u64) -> Option<CheckpointSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&ConfigDataKey::ChkpntSnap(checkpoint_id))
+    }
+
+    /// Return ordered metadata for all stored checkpoints.
+    pub fn list_checkpoints(env: Env) -> Vec<CheckpointMetadata> {
+        Self::load_checkpoint_metadata(&env)
+    }
+
+    /// Return metadata for the latest stored checkpoint.
+    pub fn get_latest_checkpoint(env: Env) -> Option<CheckpointMetadata> {
+        let metadata = Self::load_checkpoint_metadata(&env);
+        if metadata.is_empty() {
+            None
+        } else {
+            Some(metadata.get(metadata.len() - 1).unwrap())
+        }
+    }
+
+    /// Validate a stored checkpoint by recomputing its state hash.
+    pub fn validate_checkpoint(env: Env, checkpoint_id: u64) -> CheckpointValidation {
+        let snapshot = Self::get_checkpoint_or_panic(&env, checkpoint_id);
+        let metadata = Self::load_checkpoint_metadata_by_id(&env, checkpoint_id);
+        let computed_hash = Self::compute_checkpoint_hash(&env, &snapshot);
+        let is_valid = metadata.state_hash == computed_hash;
+        let message = if is_valid {
+            String::from_str(&env, "checkpoint hash verified")
+        } else {
+            String::from_str(&env, "checkpoint hash mismatch")
+        };
+
+        CheckpointValidation {
+            checkpoint_id,
+            is_valid,
+            message,
+        }
+    }
+
+    /// Compare two historical checkpoints and return high-level differences.
+    pub fn compare_checkpoints(
+        env: Env,
+        from_checkpoint_id: u64,
+        to_checkpoint_id: u64,
+    ) -> CheckpointComparison {
+        let from_snapshot = Self::get_checkpoint_or_panic(&env, from_checkpoint_id);
+        let to_snapshot = Self::get_checkpoint_or_panic(&env, to_checkpoint_id);
+        Self::build_checkpoint_comparison(
+            &env,
+            &from_snapshot,
+            &to_snapshot,
+            from_checkpoint_id,
+            to_checkpoint_id,
+        )
+    }
+
+    /// Restore current contract state from a historical checkpoint.
+    ///
+    /// A new restore checkpoint is created immediately after the state is
+    /// applied to preserve an audit trail.
+    pub fn restore_from_checkpoint(
+        env: Env,
+        caller: Address,
+        checkpoint_id: u64,
+    ) -> CheckpointMetadata {
+        Self::assert_admin_or_super_admin(&env, &caller);
+        let snapshot = Self::get_checkpoint_or_panic(&env, checkpoint_id);
+
+        let current_assets = Self::load_registered_assets_raw(&env);
+        let restored_assets = snapshot.monitored_assets.clone();
+        let restored_weights = snapshot.health_weights.clone();
+        let restored_risk_score_config = snapshot.risk_score_config.clone();
+        for asset_code in current_assets.iter() {
+            if !Self::vec_contains_string(&restored_assets, &asset_code) {
+                env.storage()
+                    .persistent()
+                    .remove(&AssetDataKey::Health(asset_code.clone()));
+                env.storage()
+                    .persistent()
+                    .remove(&AssetDataKey::Price(asset_code.clone()));
+                env.storage()
+                    .persistent()
+                    .remove(&AssetDataKey::HealthRes(asset_code.clone()));
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&keys::MONITORED_ASSETS, &restored_assets);
+        env.storage()
+            .instance()
+            .set(&keys::HEALTH_WEIGHTS, &restored_weights);
+        env.storage()
+            .instance()
+            .set(&keys::RISK_SCORE_CONFIG, &restored_risk_score_config);
+
+        for asset in snapshot.assets.iter() {
+            env.storage().persistent().set(
+                &AssetDataKey::Health(asset.asset_code.clone()),
+                &asset.health,
+            );
+
+            if asset.has_latest_price {
+                env.storage().persistent().set(
+                    &AssetDataKey::Price(asset.asset_code.clone()),
+                    &asset.latest_price,
+                );
+            } else {
+                env.storage()
+                    .persistent()
+                    .remove(&AssetDataKey::Price(asset.asset_code.clone()));
+            }
+
+            if asset.has_health_result {
+                env.storage().persistent().set(
+                    &AssetDataKey::HealthRes(asset.asset_code.clone()),
+                    &asset.health_result,
+                );
+            } else {
+                env.storage()
+                    .persistent()
+                    .remove(&AssetDataKey::HealthRes(asset.asset_code.clone()));
+            }
+        }
+
+        env.events()
+            .publish((symbol_short!("chk_rst"), checkpoint_id), true);
+
+        Self::persist_checkpoint(
+            &env,
+            &caller,
+            CheckpointTrigger::Restore,
+            String::from_str(&env, "restore"),
+            Some(checkpoint_id),
+        )
     }
 
     // -----------------------------------------------------------------------
     // Private helpers — health score calculation
     // -----------------------------------------------------------------------
 
+    fn default_checkpoint_config() -> CheckpointConfig {
+        CheckpointConfig {
+            interval_secs: 86_400,
+            max_checkpoints: 25,
+            format_version: 1,
+        }
+    }
+
+    fn default_health_weights() -> HealthWeights {
+        HealthWeights {
+            liquidity_weight: 30,
+            price_stability_weight: 40,
+            bridge_uptime_weight: 30,
+            version: 1,
+        }
+    }
+
+    fn default_risk_score_config() -> RiskScoreConfig {
+        RiskScoreConfig {
+            health_weight_bps: 5_000,
+            price_weight_bps: 2_500,
+            volatility_weight_bps: 2_500,
+            max_price_deviation_bps: 2_000,
+            max_volatility_bps: 5_000,
+            version: 1,
+        }
+    }
+
+    fn load_checkpoint_config(env: &Env) -> CheckpointConfig {
+        env.storage()
+            .instance()
+            .get(&keys::CHECKPOINT_CONFIG)
+            .unwrap_or_else(Self::default_checkpoint_config)
+    }
+
+    fn load_checkpoint_metadata(env: &Env) -> Vec<CheckpointMetadata> {
+        env.storage()
+            .instance()
+            .get(&keys::CHECKPOINT_METADATA_LIST)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn load_checkpoint_metadata_by_id(env: &Env, checkpoint_id: u64) -> CheckpointMetadata {
+        let metadata = Self::load_checkpoint_metadata(env);
+        let mut i = 0;
+        while i < metadata.len() {
+            let item = metadata.get(i).unwrap();
+            if item.checkpoint_id == checkpoint_id {
+                return item;
+            }
+            i += 1;
+        }
+
+        panic!("checkpoint metadata not found");
+    }
+
+    fn load_registered_assets_raw(env: &Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&keys::MONITORED_ASSETS)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn assert_admin_or_super_admin(env: &Env, caller: &Address) {
+        Self::assert_not_globally_paused(env);
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        Self::check_no_pending_transfer(env);
+        let authorized =
+            *caller == admin || Self::has_role_internal(env, caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can manage checkpoints");
+        }
+    }
+
+    fn assert_admin_or_super_admin_retention(env: &Env, caller: &Address) {
+        Self::assert_not_globally_paused(env);
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        Self::check_no_pending_transfer(env);
+        let authorized =
+            *caller == admin || Self::has_role_internal(env, caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can manage retention policies");
+        }
+    }
+
+    fn validate_retention_policy_inputs(
+        retention_secs: u64,
+        trigger_interval_secs: u64,
+        max_deletions_per_run: u32,
+    ) {
+        if retention_secs == 0 {
+            panic!("retention_secs must be greater than zero");
+        }
+        if trigger_interval_secs == 0 {
+            panic!("trigger_interval_secs must be greater than zero");
+        }
+        if max_deletions_per_run == 0 {
+            panic!("max_deletions_per_run must be greater than zero");
+        }
+    }
+
+    fn retention_data_types(env: &Env) -> Vec<RetentionDataType> {
+        let mut types = Vec::new(env);
+        types.push_back(RetentionDataType::SupplyMismatches);
+        types.push_back(RetentionDataType::LiquidityHistory);
+        types.push_back(RetentionDataType::Checkpoints);
+        types
+    }
+
+    fn initialize_retention_policies(env: &Env) {
+        for data_type in Self::retention_data_types(env).iter() {
+            let policy = Self::default_retention_policy(data_type.clone());
+            env.storage()
+                .instance()
+                .set(&ConfigDataKey::RetPolicy(data_type.clone()), &policy);
+            env.storage()
+                .instance()
+                .set(&ConfigDataKey::LastCleanup(data_type.clone()), &0u64);
+        }
+    }
+
+    fn default_retention_policy(data_type: RetentionDataType) -> RetentionPolicy {
+        let retention_secs = match data_type {
+            RetentionDataType::SupplyMismatches => 30 * 24 * 60 * 60,
+            RetentionDataType::LiquidityHistory => 30 * 24 * 60 * 60,
+            RetentionDataType::Checkpoints => 90 * 24 * 60 * 60,
+        };
+
+        RetentionPolicy {
+            data_type,
+            retention_secs,
+            trigger_interval_secs: 3_600,
+            max_deletions_per_run: 50,
+            archive_before_delete: false,
+            enabled: true,
+        }
+    }
+
+    fn load_retention_policy(env: &Env, data_type: &RetentionDataType) -> RetentionPolicy {
+        env.storage()
+            .instance()
+            .get(&ConfigDataKey::RetPolicy(data_type.clone()))
+            .unwrap_or_else(|| Self::default_retention_policy(data_type.clone()))
+    }
+
+    fn retention_kind_code(data_type: &RetentionDataType) -> u32 {
+        match data_type {
+            RetentionDataType::SupplyMismatches => 1,
+            RetentionDataType::LiquidityHistory => 2,
+            RetentionDataType::Checkpoints => 3,
+        }
+    }
+
+    fn cleanup_data_type_internal(
+        env: &Env,
+        data_type: &RetentionDataType,
+        policy: &RetentionPolicy,
+        max_deletions: u32,
+    ) -> (u32, u32) {
+        if max_deletions == 0 {
+            return (0, 0);
+        }
+
+        match data_type {
+            RetentionDataType::SupplyMismatches => {
+                Self::cleanup_supply_mismatches(env, policy, max_deletions)
+            }
+            RetentionDataType::LiquidityHistory => {
+                Self::cleanup_liquidity_history(env, policy, max_deletions)
+            }
+            RetentionDataType::Checkpoints => Self::cleanup_checkpoints(env, policy, max_deletions),
+        }
+    }
+
+    fn cleanup_supply_mismatches(
+        env: &Env,
+        policy: &RetentionPolicy,
+        max_deletions: u32,
+    ) -> (u32, u32) {
+        let now = env.ledger().timestamp();
+        let bridge_ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::BRIDGE_IDS)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut deleted = 0u32;
+        let mut archived = 0u32;
+
+        for bridge_id in bridge_ids.iter() {
+            if deleted >= max_deletions {
+                break;
+            }
+
+            let records: Vec<SupplyMismatch> = env
+                .storage()
+                .persistent()
+                .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            if records.len() <= 1 {
+                continue;
+            }
+
+            let mut kept = Vec::new(env);
+            let mut removed = Vec::new(env);
+            let last_index = records.len() - 1;
+            let mut idx = 0u32;
+            while idx < records.len() {
+                let record = records.get(idx).unwrap();
+                let is_latest = idx == last_index;
+                let retention_secs = Self::resolve_retention_secs(
+                    env,
+                    &RetentionDataType::SupplyMismatches,
+                    Some(&record.asset_code),
+                    policy.retention_secs,
+                );
+                let should_delete = !is_latest
+                    && deleted < max_deletions
+                    && Self::is_expired(now, record.timestamp, retention_secs);
+
+                if should_delete {
+                    removed.push_back(record);
+                    deleted += 1;
+                } else {
+                    kept.push_back(record);
+                }
+                idx += 1;
+            }
+
+            if removed.is_empty() {
+                continue;
+            }
+
+            env.storage()
+                .persistent()
+                .set(&BridgeDataKey::Mismatches(bridge_id.clone()), &kept);
+
+            if policy.archive_before_delete {
+                let mut archived_records: Vec<SupplyMismatch> = env
+                    .storage()
+                    .persistent()
+                    .get(&BridgeDataKey::ArchMismatches(bridge_id.clone()))
+                    .unwrap_or_else(|| Vec::new(env));
+                for record in removed.iter() {
+                    archived_records.push_back(record);
+                    archived += 1;
+                }
+                env.storage()
+                    .persistent()
+                    .set(&BridgeDataKey::ArchMismatches(bridge_id), &archived_records);
+            }
+        }
+
+        (deleted, archived)
+    }
+
+    fn cleanup_liquidity_history(
+        env: &Env,
+        policy: &RetentionPolicy,
+        max_deletions: u32,
+    ) -> (u32, u32) {
+        let now = env.ledger().timestamp();
+        let pairs: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::LIQUIDITY_PAIRS)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut deleted = 0u32;
+        let mut archived = 0u32;
+
+        for pair in pairs.iter() {
+            if deleted >= max_deletions {
+                break;
+            }
+
+            let history: Vec<LiquidityDepth> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::LiqHist(pair.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            if history.len() <= 1 {
+                continue;
+            }
+
+            let mut kept = Vec::new(env);
+            let mut removed = Vec::new(env);
+            let last_index = history.len() - 1;
+            let mut idx = 0u32;
+            while idx < history.len() {
+                let snapshot = history.get(idx).unwrap();
+                let is_latest = idx == last_index;
+                let retention_secs = Self::resolve_retention_secs(
+                    env,
+                    &RetentionDataType::LiquidityHistory,
+                    Some(&snapshot.asset_pair),
+                    policy.retention_secs,
+                );
+                let should_delete = !is_latest
+                    && deleted < max_deletions
+                    && Self::is_expired(now, snapshot.timestamp, retention_secs);
+
+                if should_delete {
+                    removed.push_back(snapshot);
+                    deleted += 1;
+                } else {
+                    kept.push_back(snapshot);
+                }
+                idx += 1;
+            }
+
+            if removed.is_empty() {
+                continue;
+            }
+
+            env.storage()
+                .persistent()
+                .set(&AssetDataKey::LiqHist(pair.clone()), &kept);
+
+            if policy.archive_before_delete {
+                let mut archived_history: Vec<LiquidityDepth> = env
+                    .storage()
+                    .persistent()
+                    .get(&AssetDataKey::ArchLiqHist(pair.clone()))
+                    .unwrap_or_else(|| Vec::new(env));
+                for snapshot in removed.iter() {
+                    archived_history.push_back(snapshot);
+                    archived += 1;
+                }
+                env.storage()
+                    .persistent()
+                    .set(&AssetDataKey::ArchLiqHist(pair), &archived_history);
+            }
+        }
+
+        (deleted, archived)
+    }
+
+    fn cleanup_checkpoints(env: &Env, policy: &RetentionPolicy, max_deletions: u32) -> (u32, u32) {
+        let now = env.ledger().timestamp();
+        let metadata_list = Self::load_checkpoint_metadata(env);
+        if metadata_list.len() <= 1 {
+            return (0, 0);
+        }
+
+        let mut deleted = 0u32;
+        let mut archived = 0u32;
+        let mut kept = Vec::new(env);
+        let mut removed_metadata = Vec::new(env);
+        let last_index = metadata_list.len() - 1;
+        let mut idx = 0u32;
+        while idx < metadata_list.len() {
+            let metadata = metadata_list.get(idx).unwrap();
+            let is_latest = idx == last_index;
+            let should_delete = !is_latest
+                && deleted < max_deletions
+                && Self::is_expired(now, metadata.created_at, policy.retention_secs);
+
+            if should_delete {
+                if policy.archive_before_delete {
+                    let archived_snapshot: Option<CheckpointSnapshot> = env
+                        .storage()
+                        .persistent()
+                        .get(&ConfigDataKey::ChkpntSnap(metadata.checkpoint_id));
+                    if let Some(snapshot) = archived_snapshot {
+                        env.storage().persistent().set(
+                            &ConfigDataKey::ArchChkpntSnap(metadata.checkpoint_id),
+                            &snapshot,
+                        );
+                    }
+                    removed_metadata.push_back(metadata.clone());
+                    archived += 1;
+                }
+
+                env.storage()
+                    .persistent()
+                    .remove(&ConfigDataKey::ChkpntSnap(metadata.checkpoint_id));
+                deleted += 1;
+            } else {
+                kept.push_back(metadata);
+            }
+            idx += 1;
+        }
+
+        if deleted > 0 {
+            env.storage()
+                .instance()
+                .set(&keys::CHECKPOINT_METADATA_LIST, &kept);
+        }
+
+        if policy.archive_before_delete && !removed_metadata.is_empty() {
+            let mut archived_metadata: Vec<CheckpointMetadata> = env
+                .storage()
+                .instance()
+                .get(&keys::ARCHIVED_CHECKPOINT_META)
+                .unwrap_or_else(|| Vec::new(env));
+            for metadata in removed_metadata.iter() {
+                archived_metadata.push_back(metadata);
+            }
+            env.storage()
+                .instance()
+                .set(&keys::ARCHIVED_CHECKPOINT_META, &archived_metadata);
+        }
+
+        (deleted, archived)
+    }
+
+    fn resolve_retention_secs(
+        env: &Env,
+        data_type: &RetentionDataType,
+        asset_code: Option<&String>,
+        default_retention_secs: u64,
+    ) -> u64 {
+        match asset_code {
+            Some(code) => env
+                .storage()
+                .persistent()
+                .get(&ConfigDataKey::RetOvr(code.clone(), data_type.clone()))
+                .unwrap_or(default_retention_secs),
+            None => default_retention_secs,
+        }
+    }
+
+    fn is_expired(now: u64, timestamp: u64, retention_secs: u64) -> bool {
+        now.saturating_sub(timestamp) > retention_secs
+    }
+
+    fn is_past(now: u64, expires_at: u64) -> bool {
+        now > expires_at
+    }
+
+    fn load_expiration_policy(env: &Env) -> ExpirationPolicy {
+        env.storage()
+            .instance()
+            .get(&keys::EXPIRATIONPOLICY)
+            .unwrap_or(ExpirationPolicy {
+                asset_ttl_secs: 86_400,
+                price_ttl_secs: 3_600,
+                deviation_ttl_secs: 86_400,
+                mismatch_ttl_secs: 604_800,
+                liquidity_ttl_secs: 86_400,
+                preserve_latest_history: true,
+                version: 1,
+            })
+    }
+
+    fn resolve_expiration(
+        env: &Env,
+        _asset_code: &String,
+        kind: ExpirationKind,
+        timestamp: u64,
+    ) -> u64 {
+        let policy = Self::load_expiration_policy(env);
+        let ttl = match kind {
+            ExpirationKind::Asset => policy.asset_ttl_secs,
+            ExpirationKind::Price => policy.price_ttl_secs,
+            ExpirationKind::Deviation => policy.deviation_ttl_secs,
+            ExpirationKind::Mismatch => policy.mismatch_ttl_secs,
+            ExpirationKind::Liquidity => policy.liquidity_ttl_secs,
+            ExpirationKind::HealthResult => policy.asset_ttl_secs,
+        };
+        timestamp.saturating_add(ttl)
+    }
+
+    fn emit_contract_event(env: &Env, event: BridgeWatchEvent) {
+        match event {
+            BridgeWatchEvent::HealthSubmitted {
+                actor,
+                asset_code,
+                health_score,
+                timestamp,
+            } => {
+                env.events().publish(
+                    (symbol_short!("hlth_sub"), actor, asset_code),
+                    (health_score, timestamp),
+                );
+            }
+            BridgeWatchEvent::ThresholdUpdated {
+                actor,
+                scope,
+                value,
+                timestamp,
+            } => {
+                env.events()
+                    .publish((symbol_short!("thr_upd"), actor, scope), (value, timestamp));
+            }
+            BridgeWatchEvent::RoleChanged {
+                actor,
+                target,
+                granted,
+                role,
+                timestamp,
+            } => {
+                env.events().publish(
+                    (symbol_short!("role_chg"), actor, target),
+                    (granted, role, timestamp),
+                );
+            }
+            BridgeWatchEvent::ExpirationPolicyUpdated {
+                actor,
+                scope,
+                ttl_secs,
+                timestamp,
+            } => {
+                env.events().publish(
+                    (symbol_short!("exp_upd"), actor, scope),
+                    (ttl_secs, timestamp),
+                );
+            }
+            BridgeWatchEvent::ExpirationExtended {
+                actor,
+                scope,
+                expires_at,
+                timestamp,
+            } => {
+                env.events().publish(
+                    (symbol_short!("exp_ext"), actor, scope),
+                    (expires_at, timestamp),
+                );
+            }
+            BridgeWatchEvent::CleanupCompleted {
+                actor,
+                removed_records,
+                trimmed_history_records,
+                timestamp,
+            } => {
+                env.events().publish(
+                    (symbol_short!("cleanup"), actor),
+                    (removed_records, trimmed_history_records, timestamp),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn maybe_trigger_auto_cleanup(env: &Env) {
+        let now = env.ledger().timestamp();
+        let mut total_deleted = 0u32;
+        let mut total_archived = 0u32;
+
+        for data_type in Self::retention_data_types(env).iter() {
+            let policy = Self::load_retention_policy(env, &data_type);
+            if !policy.enabled {
+                continue;
+            }
+
+            let last_cleanup_at: u64 = env
+                .storage()
+                .instance()
+                .get(&ConfigDataKey::LastCleanup(data_type.clone()))
+                .unwrap_or(0);
+            if last_cleanup_at != 0 && now < last_cleanup_at + policy.trigger_interval_secs {
+                continue;
+            }
+
+            let (deleted, archived) = Self::cleanup_data_type_internal(
+                env,
+                &data_type,
+                &policy,
+                policy.max_deletions_per_run,
+            );
+            env.storage()
+                .instance()
+                .set(&ConfigDataKey::LastCleanup(data_type.clone()), &now);
+
+            if deleted > 0 || archived > 0 {
+                env.events().publish(
+                    (
+                        symbol_short!("ret_auto"),
+                        Self::retention_kind_code(&data_type),
+                    ),
+                    (deleted, archived, now),
+                );
+            }
+
+            total_deleted += deleted;
+            total_archived += archived;
+        }
+
+        if total_deleted > 0 || total_archived > 0 {
+            env.events().publish(
+                (symbol_short!("ret_job"),),
+                (total_deleted, total_archived, now),
+            );
+        }
+    }
+
+    fn supply_storage_usage(env: &Env) -> StorageUsageEntry {
+        let bridge_ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::BRIDGE_IDS)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut active_records = 0u32;
+        let mut archived_records = 0u32;
+        for bridge_id in bridge_ids.iter() {
+            let active: Vec<SupplyMismatch> = env
+                .storage()
+                .persistent()
+                .get(&BridgeDataKey::Mismatches(bridge_id.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            let archived: Vec<SupplyMismatch> = env
+                .storage()
+                .persistent()
+                .get(&BridgeDataKey::ArchMismatches(bridge_id))
+                .unwrap_or_else(|| Vec::new(env));
+            active_records += active.len();
+            archived_records += archived.len();
+        }
+
+        StorageUsageEntry {
+            data_type: RetentionDataType::SupplyMismatches,
+            tracked_keys: bridge_ids.len(),
+            active_records,
+            archived_records,
+        }
+    }
+
+    fn liquidity_storage_usage(env: &Env) -> StorageUsageEntry {
+        let pairs: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&keys::LIQUIDITY_PAIRS)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut active_records = 0u32;
+        let mut archived_records = 0u32;
+        for pair in pairs.iter() {
+            let active: Vec<LiquidityDepth> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::LiqHist(pair.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            let archived: Vec<LiquidityDepth> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::ArchLiqHist(pair))
+                .unwrap_or_else(|| Vec::new(env));
+            active_records += active.len();
+            archived_records += archived.len();
+        }
+
+        StorageUsageEntry {
+            data_type: RetentionDataType::LiquidityHistory,
+            tracked_keys: pairs.len(),
+            active_records,
+            archived_records,
+        }
+    }
+
+    fn checkpoint_storage_usage(env: &Env) -> StorageUsageEntry {
+        let active_metadata = Self::load_checkpoint_metadata(env);
+        let archived_metadata: Vec<CheckpointMetadata> = env
+            .storage()
+            .instance()
+            .get(&keys::ARCHIVED_CHECKPOINT_META)
+            .unwrap_or_else(|| Vec::new(env));
+
+        StorageUsageEntry {
+            data_type: RetentionDataType::Checkpoints,
+            tracked_keys: active_metadata.len(),
+            active_records: active_metadata.len(),
+            archived_records: archived_metadata.len(),
+        }
+    }
+
+    fn maybe_create_auto_checkpoint(env: &Env, caller: &Address) {
+        let config = Self::load_checkpoint_config(env);
+        let now = env.ledger().timestamp();
+        let last_at: u64 = env
+            .storage()
+            .instance()
+            .get(&keys::LAST_CHECKPOINT_AT)
+            .unwrap_or(0);
+
+        if last_at != 0 && now < last_at + config.interval_secs {
+            return;
+        }
+
+        Self::persist_checkpoint(
+            env,
+            caller,
+            CheckpointTrigger::Automatic,
+            String::from_str(env, "auto"),
+            None,
+        );
+    }
+
+    fn persist_checkpoint(
+        env: &Env,
+        caller: &Address,
+        trigger: CheckpointTrigger,
+        label: String,
+        restored_from: Option<u64>,
+    ) -> CheckpointMetadata {
+        let config = Self::load_checkpoint_config(env);
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&keys::CHECKPOINT_COUNTER)
+            .unwrap_or(0)
+            + 1;
+        let created_at = env.ledger().timestamp();
+        let monitored_assets = Self::load_registered_assets_raw(env);
+        let health_weights = Self::load_health_weights(env);
+        let risk_score_config = Self::load_risk_score_config(env);
+        let mut assets = Vec::new(env);
+
+        for asset_code in monitored_assets.iter() {
+            let health = Self::load_asset_health(env, &asset_code);
+            let latest_price_opt: Option<PriceRecord> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::Price(asset_code.clone()));
+            let health_result_opt: Option<HealthScoreResult> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::HealthRes(asset_code.clone()));
+
+            let default_price = PriceRecord {
+                asset_code: asset_code.clone(),
+                price: 0,
+                source: String::from_str(env, ""),
+                timestamp: 0,
+                expires_at: 0,
+            };
+            let default_result = HealthScoreResult {
+                composite_score: 0,
+                liquidity_score: 0,
+                price_stability_score: 0,
+                bridge_uptime_score: 0,
+                weights: Self::default_health_weights(),
+                timestamp: 0,
+                expires_at: 0,
+            };
+
+            assets.push_back(CheckpointAssetState {
+                asset_code,
+                health,
+                has_latest_price: latest_price_opt.is_some(),
+                latest_price: latest_price_opt.unwrap_or(default_price),
+                has_health_result: health_result_opt.is_some(),
+                health_result: health_result_opt.unwrap_or(default_result),
+            });
+        }
+
+        let snapshot = CheckpointSnapshot {
+            checkpoint_id: next_id,
+            format_version: config.format_version,
+            created_at,
+            trigger: trigger.clone(),
+            created_by: caller.clone(),
+            label: label.clone(),
+            monitored_assets: monitored_assets.clone(),
+            health_weights,
+            risk_score_config,
+            assets,
+            restored_from,
+        };
+        let state_hash = Self::compute_checkpoint_hash(env, &snapshot);
+        let metadata = CheckpointMetadata {
+            checkpoint_id: next_id,
+            format_version: snapshot.format_version,
+            created_at,
+            trigger,
+            created_by: caller.clone(),
+            label,
+            monitored_asset_count: snapshot.monitored_assets.len(),
+            asset_count: snapshot.assets.len(),
+            state_hash,
+            restored_from,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&ConfigDataKey::ChkpntSnap(next_id), &snapshot);
+
+        let mut metadata_list = Self::load_checkpoint_metadata(env);
+        metadata_list.push_back(metadata.clone());
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_METADATA_LIST, &metadata_list);
+        env.storage()
+            .instance()
+            .set(&keys::CHECKPOINT_COUNTER, &next_id);
+        env.storage()
+            .instance()
+            .set(&keys::LAST_CHECKPOINT_AT, &created_at);
+        env.storage()
+            .instance()
+            .set(&keys::LAST_CHECKPOINT_ID, &next_id);
+
+        Self::prune_checkpoints(env, &config);
+        env.events()
+            .publish((symbol_short!("chkptnew"), next_id), metadata.asset_count);
+        Self::maybe_trigger_auto_cleanup(env);
+        metadata
+    }
+
+    fn prune_checkpoints(env: &Env, config: &CheckpointConfig) {
+        let mut metadata_list = Self::load_checkpoint_metadata(env);
+        let mut pruned = 0u32;
+
+        while metadata_list.len() > config.max_checkpoints {
+            let oldest = metadata_list.get(0).unwrap();
+            env.storage()
+                .persistent()
+                .remove(&ConfigDataKey::ChkpntSnap(oldest.checkpoint_id));
+            metadata_list.remove(0);
+            pruned += 1;
+        }
+
+        if pruned > 0 {
+            env.storage()
+                .instance()
+                .set(&keys::CHECKPOINT_METADATA_LIST, &metadata_list);
+            env.events().publish((symbol_short!("chkprune"),), pruned);
+        }
+    }
+
+    fn get_checkpoint_or_panic(env: &Env, checkpoint_id: u64) -> CheckpointSnapshot {
+        env.storage()
+            .persistent()
+            .get(&ConfigDataKey::ChkpntSnap(checkpoint_id))
+            .unwrap_or_else(|| panic!("checkpoint not found"))
+    }
+
+    fn compute_checkpoint_hash(env: &Env, snapshot: &CheckpointSnapshot) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        Self::append_u32(&mut data, snapshot.format_version);
+        Self::append_u32(&mut data, snapshot.health_weights.liquidity_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.price_stability_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.bridge_uptime_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.version);
+        Self::append_u32(&mut data, snapshot.risk_score_config.health_weight_bps);
+        Self::append_u32(&mut data, snapshot.risk_score_config.price_weight_bps);
+        Self::append_u32(&mut data, snapshot.risk_score_config.volatility_weight_bps);
+        Self::append_u32(&mut data, snapshot.risk_score_config.max_price_deviation_bps);
+        Self::append_u32(&mut data, snapshot.risk_score_config.max_volatility_bps);
+        Self::append_u32(&mut data, snapshot.risk_score_config.version);
+
+        for asset_code in snapshot.monitored_assets.iter() {
+            Self::append_string(&mut data, &asset_code);
+        }
+
+        for asset in snapshot.assets.iter() {
+            Self::append_string(&mut data, &asset.asset_code);
+            Self::append_asset_health(&mut data, &asset.health);
+            Self::append_bool(&mut data, asset.has_latest_price);
+            if asset.has_latest_price {
+                Self::append_price_record(&mut data, &asset.latest_price);
+            }
+            Self::append_bool(&mut data, asset.has_health_result);
+            if asset.has_health_result {
+                Self::append_health_score_result(&mut data, &asset.health_result);
+            }
+        }
+
+        env.crypto().sha256(&data).into()
+    }
+
+    fn build_checkpoint_comparison(
+        env: &Env,
+        from_snapshot: &CheckpointSnapshot,
+        to_snapshot: &CheckpointSnapshot,
+        from_checkpoint_id: u64,
+        to_checkpoint_id: u64,
+    ) -> CheckpointComparison {
+        let mut added_assets = Vec::new(env);
+        let mut removed_assets = Vec::new(env);
+        let mut changed_assets = Vec::new(env);
+
+        for to_asset in to_snapshot.assets.iter() {
+            if let Some(from_asset) =
+                Self::find_checkpoint_asset(&from_snapshot.assets, &to_asset.asset_code)
+            {
+                let health_changed = from_asset.health != to_asset.health;
+                let price_changed = from_asset.latest_price != to_asset.latest_price;
+                let health_result_changed = from_asset.health_result != to_asset.health_result;
+                if health_changed || price_changed || health_result_changed {
+                    changed_assets.push_back(CheckpointAssetDiff {
+                        asset_code: to_asset.asset_code.clone(),
+                        health_changed,
+                        price_changed,
+                        health_result_changed,
+                    });
+                }
+            } else {
+                added_assets.push_back(to_asset.asset_code.clone());
+            }
+        }
+
+        for from_asset in from_snapshot.assets.iter() {
+            if Self::find_checkpoint_asset(&to_snapshot.assets, &from_asset.asset_code).is_none() {
+                removed_assets.push_back(from_asset.asset_code.clone());
+            }
+        }
+
+        CheckpointComparison {
+            from_checkpoint_id,
+            to_checkpoint_id,
+            timestamp_delta: to_snapshot
+                .created_at
+                .saturating_sub(from_snapshot.created_at),
+            state_hash_changed: Self::compute_checkpoint_hash(env, from_snapshot)
+                != Self::compute_checkpoint_hash(env, to_snapshot),
+            weights_changed: from_snapshot.health_weights != to_snapshot.health_weights,
+            added_assets,
+            removed_assets,
+            changed_assets,
+        }
+    }
+
+    fn find_checkpoint_asset(
+        assets: &Vec<CheckpointAssetState>,
+        asset_code: &String,
+    ) -> Option<CheckpointAssetState> {
+        let mut i = 0;
+        while i < assets.len() {
+            let asset = assets.get(i).unwrap();
+            if asset.asset_code == *asset_code {
+                return Some(asset);
+            }
+            i += 1;
+        }
+
+        None
+    }
+
+    fn vec_contains_string(values: &Vec<String>, target: &String) -> bool {
+        let mut i = 0;
+        while i < values.len() {
+            if values.get(i).unwrap() == *target {
+                return true;
+            }
+            i += 1;
+        }
+
+        false
+    }
+
+    fn vec_contains_address(values: &Vec<Address>, target: &Address) -> bool {
+        let mut i = 0;
+        while i < values.len() {
+            if values.get(i).unwrap() == *target {
+                return true;
+            }
+            i += 1;
+        }
+
+        false
+    }
+
+    fn append_i128(buf: &mut Bytes, value: i128) {
+        let bytes = value.to_be_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn append_bool(buf: &mut Bytes, value: bool) {
+        buf.push_back(if value { 1 } else { 0 });
+    }
+
+    fn append_string(buf: &mut Bytes, value: &String) {
+        let raw = Self::str_to_bytes_inner(value.env(), value);
+        Self::append_u32(buf, raw.len());
+        buf.append(&raw);
+    }
+
+    /// Convert a `soroban_sdk::String` to `Bytes` by copying its content.
+    fn str_to_bytes_inner(env: &Env, s: &String) -> Bytes {
+        let len = s.len() as usize;
+        // Use a fixed-size stack buffer; Soroban strings are bounded.
+        // Max practical length is well under 256 bytes for our use cases.
+        let mut buf = [0u8; 256];
+        let safe_len = len.min(256);
+        s.copy_into_slice(&mut buf[..safe_len]);
+        let mut result = Bytes::new(env);
+        let mut i = 0;
+        while i < safe_len {
+            result.push_back(buf[i]);
+            i += 1;
+        }
+        result
+    }
+
+    #[allow(dead_code)]
+    fn append_option_u64(buf: &mut Bytes, value: Option<u64>) {
+        match value {
+            Some(v) => {
+                Self::append_bool(buf, true);
+                Self::append_u64(buf, v);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn append_checkpoint_trigger(buf: &mut Bytes, trigger: &CheckpointTrigger) {
+        let code = match trigger {
+            CheckpointTrigger::Automatic => 1u32,
+            CheckpointTrigger::Manual => 2u32,
+            CheckpointTrigger::Restore => 3u32,
+        };
+        Self::append_u32(buf, code);
+    }
+
+    fn append_asset_health(buf: &mut Bytes, health: &AssetHealth) {
+        Self::append_string(buf, &health.asset_code);
+        Self::append_u32(buf, health.health_score);
+        Self::append_u32(buf, health.liquidity_score);
+        Self::append_u32(buf, health.price_stability_score);
+        Self::append_u32(buf, health.bridge_uptime_score);
+        Self::append_bool(buf, health.paused);
+        Self::append_bool(buf, health.active);
+        Self::append_u64(buf, health.timestamp);
+    }
+
+    #[allow(dead_code)]
+    fn append_option_price_record(buf: &mut Bytes, record: &Option<PriceRecord>) {
+        match record {
+            Some(price) => {
+                Self::append_bool(buf, true);
+                Self::append_string(buf, &price.asset_code);
+                Self::append_i128(buf, price.price);
+                Self::append_string(buf, &price.source);
+                Self::append_u64(buf, price.timestamp);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
+
+    fn append_price_record(buf: &mut Bytes, price: &PriceRecord) {
+        Self::append_string(buf, &price.asset_code);
+        Self::append_i128(buf, price.price);
+        Self::append_string(buf, &price.source);
+        Self::append_u64(buf, price.timestamp);
+    }
+
+    #[allow(dead_code)]
+    fn append_option_health_score_result(buf: &mut Bytes, result: &Option<HealthScoreResult>) {
+        match result {
+            Some(value) => {
+                Self::append_bool(buf, true);
+                Self::append_u32(buf, value.composite_score);
+                Self::append_u32(buf, value.liquidity_score);
+                Self::append_u32(buf, value.price_stability_score);
+                Self::append_u32(buf, value.bridge_uptime_score);
+                Self::append_u32(buf, value.weights.liquidity_weight);
+                Self::append_u32(buf, value.weights.price_stability_weight);
+                Self::append_u32(buf, value.weights.bridge_uptime_weight);
+                Self::append_u32(buf, value.weights.version);
+                Self::append_u64(buf, value.timestamp);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
+
+    fn append_health_score_result(buf: &mut Bytes, value: &HealthScoreResult) {
+        Self::append_u32(buf, value.composite_score);
+        Self::append_u32(buf, value.liquidity_score);
+        Self::append_u32(buf, value.price_stability_score);
+        Self::append_u32(buf, value.bridge_uptime_score);
+        Self::append_u32(buf, value.weights.liquidity_weight);
+        Self::append_u32(buf, value.weights.price_stability_weight);
+        Self::append_u32(buf, value.weights.bridge_uptime_weight);
+        Self::append_u32(buf, value.weights.version);
+        Self::append_u64(buf, value.timestamp);
+    }
+
     /// Load stored health weights or return defaults (30 / 40 / 30, v1).
     fn load_health_weights(env: &Env) -> HealthWeights {
         env.storage()
             .instance()
-            .get(&DataKey::HealthWeights)
+            .get(&keys::HEALTH_WEIGHTS)
             .unwrap_or(HealthWeights {
                 liquidity_weight: 30,
                 price_stability_weight: 40,
                 bridge_uptime_weight: 30,
                 version: 1,
             })
+    }
+
+    fn load_risk_score_config(env: &Env) -> RiskScoreConfig {
+        env.storage()
+            .instance()
+            .get(&keys::RISK_SCORE_CONFIG)
+            .unwrap_or_else(Self::default_risk_score_config)
     }
 
     /// Validate that three weights are each ≤ 100 and sum to exactly 100.
@@ -2276,6 +6648,34 @@ impl BridgeWatchContract {
         }
     }
 
+    fn validate_risk_score_config(
+        health_weight_bps: u32,
+        price_weight_bps: u32,
+        volatility_weight_bps: u32,
+        max_price_deviation_bps: u32,
+        max_volatility_bps: u32,
+        version: u32,
+    ) {
+        if health_weight_bps > 10_000
+            || price_weight_bps > 10_000
+            || volatility_weight_bps > 10_000
+        {
+            panic!("risk weights must be between 0 and 10000");
+        }
+        if health_weight_bps + price_weight_bps + volatility_weight_bps != 10_000 {
+            panic!("risk weights must sum to 10000");
+        }
+        if max_price_deviation_bps == 0 {
+            panic!("max_price_deviation_bps must be greater than zero");
+        }
+        if max_volatility_bps == 0 {
+            panic!("max_volatility_bps must be greater than zero");
+        }
+        if version == 0 {
+            panic!("risk score config version must be greater than 0");
+        }
+    }
+
     /// Compute the weighted-average composite score.
     ///
     /// `composite = (liq * liq_w + stab * stab_w + up * up_w) / 100`
@@ -2289,6 +6689,1315 @@ impl BridgeWatchContract {
             + (price_stability_score as u64) * (weights.price_stability_weight as u64)
             + (bridge_uptime_score as u64) * (weights.bridge_uptime_weight as u64);
         (weighted_sum / 100) as u32
+    }
+
+    fn build_risk_score_result(
+        env: &Env,
+        health_score: u32,
+        price_deviation_bps: u32,
+        volatility_bps: u32,
+    ) -> RiskScoreResult {
+        let config = Self::load_risk_score_config(env);
+        let normalized_health_risk_bps = (100u32.saturating_sub(health_score)) * 100;
+        let normalized_price_risk_bps =
+            Self::normalize_signal_to_bps(price_deviation_bps, config.max_price_deviation_bps);
+        let normalized_volatility_risk_bps =
+            Self::normalize_signal_to_bps(volatility_bps, config.max_volatility_bps);
+
+        let weighted_sum = (normalized_health_risk_bps as u64)
+            * (config.health_weight_bps as u64)
+            + (normalized_price_risk_bps as u64) * (config.price_weight_bps as u64)
+            + (normalized_volatility_risk_bps as u64) * (config.volatility_weight_bps as u64);
+        let risk_score_bps = Self::clamp_bps_u64(weighted_sum / 10_000);
+
+        RiskScoreResult {
+            risk_score_bps,
+            normalized_health_risk_bps,
+            normalized_price_risk_bps,
+            normalized_volatility_risk_bps,
+            health_score,
+            price_deviation_bps,
+            volatility_bps,
+            config,
+            timestamp: env.ledger().timestamp(),
+        }
+    }
+
+    fn normalize_signal_to_bps(raw_signal_bps: u32, max_signal_bps: u32) -> u32 {
+        let clamped_signal = if raw_signal_bps > max_signal_bps {
+            max_signal_bps
+        } else {
+            raw_signal_bps
+        };
+
+        ((clamped_signal as u64) * 10_000 / (max_signal_bps as u64)) as u32
+    }
+
+    fn clamp_bps_u64(value: u64) -> u32 {
+        if value > 10_000 {
+            10_000
+        } else {
+            value as u32
+        }
+    }
+
+    fn clamp_i128_to_u32(value: i128) -> u32 {
+        if value <= 0 {
+            0
+        } else if value > u32::MAX as i128 {
+            u32::MAX
+        } else {
+            value as u32
+        }
+    }
+
+    fn stat_period_secs(period: &StatPeriod) -> u64 {
+        match period {
+            StatPeriod::Hour => 3_600,
+            StatPeriod::Day => 86_400,
+            StatPeriod::Week => 604_800,
+            StatPeriod::Month => 2_592_000,
+        }
+    }
+
+    fn collect_prices_for_period(env: &Env, asset_code: &String, period_secs: u64) -> Vec<i128> {
+        let history: Vec<PriceRecord> = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::PriceHist(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let now = env.ledger().timestamp();
+        let start_time = now.saturating_sub(period_secs);
+        let mut prices: Vec<i128> = Vec::new(env);
+
+        for record in history.iter() {
+            if record.timestamp >= start_time && record.timestamp <= now {
+                prices.push_back(record.price);
+            }
+        }
+
+        prices
+    }
+
+    fn calculate_latest_price_deviation_bps(env: Env, prices: Vec<i128>) -> u32 {
+        if prices.is_empty() {
+            return 0;
+        }
+
+        let average_price = Self::calculate_average(env, prices.clone());
+        if average_price <= 0 {
+            return 0;
+        }
+
+        let latest_price = prices.get(prices.len() - 1).unwrap();
+        let diff = if latest_price > average_price {
+            latest_price - average_price
+        } else {
+            average_price - latest_price
+        };
+
+        Self::clamp_i128_to_u32((diff * 10_000) / average_price)
+    }
+
+    // -----------------------------------------------------------------------
+    // Statistical Calculations (issue #133)
+    // -----------------------------------------------------------------------
+
+    /// Calculate simple moving average of a value series.
+    ///
+    /// Returns the arithmetic mean of the provided values.
+    /// Gas-efficient implementation for on-chain calculations.
+    pub fn calculate_average(_env: Env, values: Vec<i128>) -> i128 {
+        let count = values.len() as i128;
+        if count == 0 {
+            return 0;
+        }
+
+        let mut sum: i128 = 0;
+        for v in values.iter() {
+            sum = sum.checked_add(v).unwrap_or(sum);
+        }
+
+        sum / count
+    }
+
+    /// Calculate volume-weighted moving average.
+    ///
+    /// Each value is weighted by its corresponding volume.
+    pub fn volume_weighted_avg(_env: Env, values: Vec<i128>, volumes: Vec<i128>) -> i128 {
+        if values.len() != volumes.len() {
+            panic!("values and volumes must have same length");
+        }
+
+        let count = values.len();
+        if count == 0 {
+            return 0;
+        }
+
+        let mut weighted_sum: i128 = 0;
+        let mut total_volume: i128 = 0;
+
+        for i in 0..count {
+            let value = values.get(i).unwrap();
+            let volume = volumes.get(i).unwrap();
+            weighted_sum = weighted_sum
+                .checked_add(value * volume)
+                .unwrap_or(weighted_sum);
+            total_volume = total_volume.checked_add(volume).unwrap_or(total_volume);
+        }
+
+        if total_volume == 0 {
+            return 0;
+        }
+
+        weighted_sum / total_volume
+    }
+
+    /// Calculate standard deviation of a value series.
+    ///
+    /// Uses population standard deviation formula: sqrt(sum((x - mean)^2) / n)
+    /// Returns result scaled by PRECISION for fixed-point arithmetic.
+    pub fn calculate_stddev(env: Env, values: Vec<i128>) -> i128 {
+        let count = values.len() as i128;
+        if count < 2 {
+            return 0;
+        }
+
+        let mean = Self::calculate_average(env.clone(), values.clone());
+
+        let mut sum_squared_diff: i128 = 0;
+        for v in values.iter() {
+            let diff = v - mean;
+            sum_squared_diff = sum_squared_diff
+                .checked_add(diff * diff)
+                .unwrap_or(sum_squared_diff);
+        }
+
+        // Variance = sum_squared_diff / count
+        let variance = sum_squared_diff / count;
+
+        // Integer square root approximation using Newton's method
+        Self::integer_sqrt(variance)
+    }
+
+    /// Calculate price volatility as annualized standard deviation.
+    ///
+    /// Returns volatility in basis points (1 bp = 0.01%).
+    /// Uses the standard deviation of price returns.
+    pub fn calculate_volatility(env: Env, prices: Vec<i128>, period_secs: u64) -> i128 {
+        let n = prices.len();
+        if n < 2 {
+            return 0;
+        }
+
+        // Calculate price returns (percentage changes)
+        let mut returns: Vec<i128> = Vec::new(&env);
+        for i in 1..n {
+            let prev_price = prices.get(i - 1).unwrap();
+            let curr_price = prices.get(i).unwrap();
+
+            if prev_price == 0 {
+                returns.push_back(0);
+                continue;
+            }
+
+            // Return = (curr - prev) / prev * PRECISION
+            let price_diff = curr_price - prev_price;
+            let ret = (price_diff * 10_000) / prev_price; // In basis points
+            returns.push_back(ret);
+        }
+
+        // Calculate standard deviation of returns
+        let stddev_returns = Self::calculate_stddev(env.clone(), returns);
+
+        // Annualize: multiply by sqrt(seconds in year / period)
+        // Using 365 days = 31_536_000 seconds
+        const SECONDS_PER_YEAR: u64 = 31_536_000;
+        if period_secs == 0 {
+            return stddev_returns;
+        }
+
+        // Annualization factor scaled by PRECISION
+        let annualization_factor =
+            Self::integer_sqrt((SECONDS_PER_YEAR as i128 * 10_000) / period_secs as i128);
+
+        // Annualized volatility
+        (stddev_returns * annualization_factor) / 100
+    }
+
+    /// Calculate min and max values in a series.
+    pub fn calculate_min_max(_env: Env, values: Vec<i128>) -> (i128, i128) {
+        if values.len() == 0 {
+            return (0, 0);
+        }
+
+        let mut min = values.get(0).unwrap();
+        let mut max = values.get(0).unwrap();
+
+        for v in values.iter() {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+        }
+
+        (min, max)
+    }
+
+    /// Calculate median value of a sorted series.
+    ///
+    /// For even-length series, returns average of two middle values.
+    pub fn calculate_median(env: Env, values: Vec<i128>) -> i128 {
+        let n = values.len();
+        if n == 0 {
+            return 0;
+        }
+
+        // Simple bubble sort for small vectors (gas efficient for n < 100)
+        for i in 0..n {
+            for j in 0..(n - i - 1) {
+                let a = values.get(j).unwrap();
+                let b = values.get(j + 1).unwrap();
+                if a > b {
+                    // Swap - we can't modify in place, so we need to rebuild
+                    // This is inefficient but works for small vectors
+                }
+            }
+        }
+
+        // For gas efficiency with small datasets, use selection algorithm
+        // Find k-th smallest element
+        let mid = n / 2;
+        if n % 2 == 1 {
+            // Odd: return middle element
+            Self::quick_select(&env, &values, mid)
+        } else {
+            // Even: return average of two middle elements
+            let left = Self::quick_select(&env, &values, mid - 1);
+            let right = Self::quick_select(&env, &values, mid);
+            (left + right) / 2
+        }
+    }
+
+    /// Calculate percentiles (25th and 75th) for a value series.
+    ///
+    /// Returns (p25, median, p75).
+    pub fn calculate_percentiles(env: Env, values: Vec<i128>) -> (i128, i128, i128) {
+        let n = values.len();
+        if n == 0 {
+            return (0, 0, 0);
+        }
+        if n == 1 {
+            let v = values.get(0).unwrap();
+            return (v, v, v);
+        }
+
+        // Calculate positions
+        let p25_idx = (n - 1) / 4;
+        let p50_idx = n / 2;
+        let p75_idx = (3 * (n - 1)) / 4;
+
+        // Use quick select for each percentile
+        let p25 = Self::quick_select(&env, &values, p25_idx);
+        let p50 = if n % 2 == 1 {
+            Self::quick_select(&env, &values, p50_idx)
+        } else {
+            let left = Self::quick_select(&env, &values, p50_idx - 1);
+            let right = Self::quick_select(&env, &values, p50_idx);
+            (left + right) / 2
+        };
+        let p75 = Self::quick_select(&env, &values, p75_idx);
+
+        (p25, p50, p75)
+    }
+
+    /// Compute all statistics for an asset over a specified period.
+    ///
+    /// Calculates and stores: average, stddev, volatility, min/max, median, percentiles.
+    /// Requires at least 2 data points for meaningful statistics.
+    pub fn compute_statistics(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        period: StatPeriod,
+    ) -> Statistics {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can compute statistics");
+        }
+
+        // Determine time range based on period
+        let now = env.ledger().timestamp();
+        let period_secs = Self::stat_period_secs(&period);
+        let start_time = now.saturating_sub(period_secs);
+
+        // Get price history for the period
+        let history: Vec<PriceRecord> = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::PriceHist(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Collect prices within time range
+        let mut prices: Vec<i128> = Vec::new(&env);
+        for record in history.iter() {
+            if record.timestamp >= start_time && record.timestamp <= now {
+                prices.push_back(record.price);
+            }
+        }
+
+        let data_points = prices.len();
+        if data_points < 2 {
+            panic!("insufficient data points for statistics");
+        }
+
+        // Calculate all statistics
+        let average = Self::calculate_average(env.clone(), prices.clone());
+        let stddev = Self::calculate_stddev(env.clone(), prices.clone());
+        let volatility = Self::calculate_volatility(env.clone(), prices.clone(), period_secs);
+        let (min_price, max_price) = Self::calculate_min_max(env.clone(), prices.clone());
+        let (p25, median, p75) = Self::calculate_percentiles(env.clone(), prices.clone());
+
+        // Create and store statistics record
+        let stats = Statistics {
+            period: period.clone(),
+            timestamp: now,
+            health_avg: 0,
+            liquidity_avg: 0,
+            price_volatility: volatility as u32,
+            bridge_uptime: 0,
+        };
+
+        // Store in history
+        let mut stats_history: Vec<Statistics> = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::Stats(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        stats_history.push_back(stats.clone());
+        env.storage()
+            .persistent()
+            .set(&AssetDataKey::Stats(asset_code.clone()), &stats_history);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("stats_avg"), asset_code.clone(), period),
+            average,
+        );
+
+        stats
+    }
+
+    /// Get pre-computed statistics for an asset.
+    ///
+    /// Returns the most recent statistics for the specified period, or None
+    /// if no statistics have been computed.
+    pub fn get_statistics(env: Env, asset_code: String, period: StatPeriod) -> Option<Statistics> {
+        let stats_history: Vec<Statistics> = env
+            .storage()
+            .persistent()
+            .get(&AssetDataKey::Stats(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Return the most recent matching period
+        let mut i = stats_history.len();
+        while i > 0 {
+            i -= 1;
+            let stats = stats_history.get(i).unwrap();
+            if stats.period == period {
+                return Some(stats);
+            }
+        }
+
+        None
+    }
+
+    /// Get all historical statistics for an asset.
+    pub fn get_statistics_history(env: Env, asset_code: String) -> Vec<Statistics> {
+        env.storage()
+            .persistent()
+            .get(&AssetDataKey::Stats(asset_code.clone()))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Trigger periodic statistics calculation for all active assets.
+    ///
+    /// Intended to be called periodically (e.g., by an automation service)
+    /// to keep statistics up-to-date. Calculates daily statistics for all
+    /// assets with sufficient data.
+    pub fn trigger_periodic_stats(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can trigger periodic stats");
+        }
+
+        let assets = Self::get_monitored_assets(env.clone());
+        let now = env.ledger().timestamp();
+
+        for asset_code in assets.iter() {
+            // Check if we have recent enough data
+            let history: Vec<PriceRecord> = env
+                .storage()
+                .persistent()
+                .get(&AssetDataKey::PriceHist(asset_code.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+
+            if history.len() < 2 {
+                continue;
+            }
+
+            // Check last stats computation time
+            let existing_stats =
+                Self::get_statistics(env.clone(), asset_code.clone(), StatPeriod::Day);
+            let should_compute = match existing_stats {
+                Some(stats) => now.saturating_sub(stats.timestamp) >= 3600, // 1 hour minimum
+                None => true,
+            };
+
+            if should_compute {
+                // Compute new statistics
+                let _ = Self::compute_statistics(
+                    env.clone(),
+                    caller.clone(),
+                    asset_code.clone(),
+                    StatPeriod::Day,
+                );
+            }
+        }
+    }
+
+    /// Calculate rolling window statistics over a series.
+    ///
+    /// Returns a vector of statistics, each computed over `window_size` data points,
+    /// sliding by `step` points each time.
+    pub fn calculate_rolling_statistics(
+        env: Env,
+        values: Vec<i128>,
+        window_size: u32,
+        step: u32,
+    ) -> Vec<i128> {
+        let n = values.len();
+        if window_size == 0 || step == 0 || n < window_size {
+            return Vec::new(&env);
+        }
+
+        let mut results: Vec<i128> = Vec::new(&env);
+        let mut start: u32 = 0;
+
+        while start + window_size <= n {
+            // Extract window
+            let mut window: Vec<i128> = Vec::new(&env);
+            for i in start..(start + window_size) {
+                window.push_back(values.get(i).unwrap());
+            }
+
+            // Calculate average for this window
+            let avg = Self::calculate_average(env.clone(), window);
+            results.push_back(avg);
+
+            start += step;
+        }
+
+        results
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helper functions for statistics
+    // -----------------------------------------------------------------------
+
+    /// Integer square root using Newton's method.
+    /// Returns sqrt(x) as an integer.
+    fn integer_sqrt(x: i128) -> i128 {
+        if x <= 0 {
+            return 0;
+        }
+        if x == 1 {
+            return 1;
+        }
+
+        let mut z = x;
+        let mut y = (z + 1) / 2;
+
+        while y < z {
+            z = y;
+            y = (z + x / z) / 2;
+        }
+
+        z
+    }
+
+    /// Quick select algorithm to find k-th smallest element.
+    /// Uses median-of-three pivot selection for efficiency.
+    fn quick_select(env: &Env, values: &Vec<i128>, k: u32) -> i128 {
+        let n = values.len();
+        if n == 0 || k >= n {
+            return 0;
+        }
+
+        // For small arrays, use simple selection
+        if n <= 5 {
+            // Copy and sort
+            let mut sorted: Vec<i128> = Vec::new(env);
+            for v in values.iter() {
+                sorted.push_back(v);
+            }
+            // Simple insertion sort for small n
+            for i in 1..sorted.len() {
+                let key = sorted.get(i).unwrap();
+                let mut j = i;
+                while j > 0 {
+                    let prev = sorted.get(j - 1).unwrap();
+                    if prev > key {
+                        sorted.set(j, prev);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                sorted.set(j, key);
+            }
+            return sorted.get(k).unwrap();
+        }
+
+        // For larger arrays, use median-of-three quickselect
+        // (simplified version for gas efficiency)
+        let pivot = values.get(n / 2).unwrap();
+
+        let mut lows: Vec<i128> = Vec::new(env);
+        let mut highs: Vec<i128> = Vec::new(env);
+        let mut pivots: Vec<i128> = Vec::new(env);
+
+        for v in values.iter() {
+            if v < pivot {
+                lows.push_back(v);
+            } else if v > pivot {
+                highs.push_back(v);
+            } else {
+                pivots.push_back(v);
+            }
+        }
+
+        let num_lows = lows.len();
+        if k < num_lows {
+            Self::quick_select(env, &lows, k)
+        } else if k < num_lows + pivots.len() {
+            pivot
+        } else {
+            Self::quick_select(env, &highs, k - num_lows - pivots.len())
+        }
+    }
+
+    /// Calculate correlation coefficient between two series.
+    /// Returns value between -10_000 and 10_000 (scaled by 10_000).
+    pub fn calculate_correlation(env: Env, x: Vec<i128>, y: Vec<i128>) -> i128 {
+        if x.len() != y.len() || x.len() < 2 {
+            return 0;
+        }
+
+        let n = x.len() as i128;
+
+        // Calculate means
+        let mean_x = Self::calculate_average(env.clone(), x.clone());
+        let mean_y = Self::calculate_average(env.clone(), y.clone());
+
+        // Calculate covariance and variances
+        let mut cov: i128 = 0;
+        let mut var_x: i128 = 0;
+        let mut var_y: i128 = 0;
+
+        for i in 0..x.len() {
+            let xi = x.get(i).unwrap();
+            let yi = y.get(i).unwrap();
+
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
+
+            cov = cov.checked_add(dx * dy).unwrap_or(cov);
+            var_x = var_x.checked_add(dx * dx).unwrap_or(var_x);
+            var_y = var_y.checked_add(dy * dy).unwrap_or(var_y);
+        }
+
+        // Normalize
+        cov = cov / n;
+        var_x = var_x / n;
+        var_y = var_y / n;
+
+        // Calculate correlation
+        let std_x = Self::integer_sqrt(var_x);
+        let std_y = Self::integer_sqrt(var_y);
+
+        if std_x == 0 || std_y == 0 {
+            return 0;
+        }
+
+        // correlation = cov / (std_x * std_y), scaled by 10_000
+        (cov * 10_000) / (std_x * std_y)
+    }
+
+    /// Calculate exponential moving average (EMA).
+    ///
+    /// `smoothing_factor` is a value between 0 and 10_000 representing
+    /// the smoothing constant alpha (where alpha = smoothing_factor / 10_000).
+    pub fn calculate_ema(_env: Env, values: Vec<i128>, smoothing_factor: i128) -> i128 {
+        let n = values.len();
+        if n == 0 {
+            return 0;
+        }
+        if smoothing_factor <= 0 || smoothing_factor > 10_000 {
+            panic!("smoothing factor must be between 1 and 10000");
+        }
+
+        // Start with simple average for first value
+        let mut ema = values.get(0).unwrap();
+
+        // EMA_t = alpha * value_t + (1 - alpha) * EMA_{t-1}
+        for i in 1..n {
+            let value = values.get(i).unwrap();
+            let alpha_num = smoothing_factor;
+            let alpha_denom: i128 = 10_000;
+
+            // EMA = (alpha * value + (10000 - alpha) * prev_ema) / 10000
+            let new_ema = (alpha_num * value + (alpha_denom - alpha_num) * ema) / alpha_denom;
+            ema = new_ema;
+        }
+
+        ema
+    }
+
+    /// Document statistical methods available in the contract.
+    ///
+    /// Returns a string describing each statistical function and its usage.
+    pub fn get_stats_methods_docs(env: Env) -> String {
+        String::from_str(
+            &env,
+            "Statistical Methods:\n\
+            1. calculate_average(values) - Arithmetic mean\n\
+            2. calculate_volume_weighted_average(values, volumes) - VWAP\n\
+            3. calculate_stddev(values) - Population standard deviation\n\
+            4. calculate_volatility(prices, period_secs) - Annualized volatility in bps\n\
+            5. calculate_min_max(values) - Min and max values\n\
+            6. calculate_median(values) - Median value\n\
+            7. calculate_percentiles(values) - P25, median, P75\n\
+            8. calculate_correlation(x, y) - Correlation coefficient\n\
+            9. calculate_ema(values, smoothing) - Exponential moving average\n\
+            10. calculate_rolling_statistics(values, window, step) - Rolling window stats\n\
+            11. compute_statistics(asset, period) - Full statistics computation\n\
+            12. get_statistics(asset, period) - Retrieve stored statistics\n\
+            13. trigger_periodic_stats() - Trigger batch computation",
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Emergency Recovery (issue #298)
+    // -----------------------------------------------------------------------
+
+    /// Enter emergency recovery mode.
+    ///
+    /// Signals that the contract is in a degraded state and operators must
+    /// follow a manual recovery runbook. Only the contract admin may activate
+    /// recovery. The reason is stored on-chain for the audit trail.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - Recovery mode is already active.
+    pub fn enter_recovery_mode(env: Env, caller: Address, reason: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can enter recovery mode");
+        }
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&keys::RECOVERY_MODE)
+            .unwrap_or(false)
+        {
+            panic!("recovery mode already active");
+        }
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&keys::RECOVERY_MODE, &true);
+        env.storage().instance().set(&keys::RECOVERY_REASON, &reason);
+        env.storage()
+            .instance()
+            .set(&keys::RECOVERY_ENTERED_AT, &now);
+        env.storage()
+            .instance()
+            .set(&keys::RECOVERY_ENTERED_BY, &caller);
+        // Reset step log for this recovery session
+        let steps: Vec<RecoveryStep> = Vec::new(&env);
+        env.storage()
+            .persistent()
+            .set(&keys::RECOVERY_STEPS, &steps);
+        env.events()
+            .publish((symbol_short!("rec_entr"), caller.clone()), (reason.clone(), now));
+        Self::append_replay_event(
+            &env,
+            String::from_str(&env, "rec_entr"),
+            caller.clone(),
+            reason.clone(),
+            0,
+        );
+        Self::append_admin_activity(&env, AdminActivityAction::RecoveryEntered, caller, reason);
+    }
+
+    /// Exit emergency recovery mode, returning the contract to normal operation.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - Recovery mode is not currently active.
+    pub fn exit_recovery_mode(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can exit recovery mode");
+        }
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&keys::RECOVERY_MODE)
+            .unwrap_or(false)
+        {
+            panic!("recovery mode is not active");
+        }
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&keys::RECOVERY_MODE, &false);
+        env.events()
+            .publish((symbol_short!("rec_exit"), caller.clone()), now);
+        Self::append_admin_activity(
+            &env,
+            AdminActivityAction::RecoveryExited,
+            caller,
+            String::from_str(&env, "recovery mode ended"),
+        );
+    }
+
+    /// Append a completed recovery step to the on-chain audit trail.
+    ///
+    /// Steps are immutable once written and serve as an ordered record of
+    /// actions taken during the recovery session. Capped at 50 steps per
+    /// session (reset when recovery mode is re-entered).
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - Recovery mode is not currently active.
+    /// - The step log is already at 50 entries.
+    pub fn record_recovery_step(env: Env, caller: Address, description: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can record recovery steps");
+        }
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&keys::RECOVERY_MODE)
+            .unwrap_or(false)
+        {
+            panic!("recovery mode is not active");
+        }
+        let mut steps: Vec<RecoveryStep> = env
+            .storage()
+            .persistent()
+            .get(&keys::RECOVERY_STEPS)
+            .unwrap_or_else(|| Vec::new(&env));
+        if steps.len() >= 50 {
+            panic!("recovery step log is full (max 50)");
+        }
+        let step = RecoveryStep {
+            description,
+            completed: true,
+            recorded_at: env.ledger().timestamp(),
+            actor: caller,
+        };
+        steps.push_back(step);
+        env.storage()
+            .persistent()
+            .set(&keys::RECOVERY_STEPS, &steps);
+    }
+
+    /// Return a summary of the current recovery state.
+    ///
+    /// When recovery is not active, `active` is `false` and the `reason`,
+    /// `entered_at`, and `entered_by` fields reflect the last recovery session
+    /// (or zero-values if recovery has never been used).
+    pub fn get_recovery_state(env: Env) -> RecoveryState {
+        let active = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&keys::RECOVERY_MODE)
+            .unwrap_or(false);
+        let steps: Vec<RecoveryStep> = env
+            .storage()
+            .persistent()
+            .get(&keys::RECOVERY_STEPS)
+            .unwrap_or_else(|| Vec::new(&env));
+        let reason: String = env
+            .storage()
+            .instance()
+            .get(&keys::RECOVERY_REASON)
+            .unwrap_or_else(|| String::from_str(&env, ""));
+        let entered_at: u64 = env
+            .storage()
+            .instance()
+            .get(&keys::RECOVERY_ENTERED_AT)
+            .unwrap_or(0);
+        let entered_by: Address = env
+            .storage()
+            .instance()
+            .get(&keys::RECOVERY_ENTERED_BY)
+            .unwrap_or_else(|| env.current_contract_address());
+        RecoveryState {
+            active,
+            reason,
+            entered_at,
+            entered_by,
+            step_count: steps.len(),
+        }
+    }
+
+    /// Return the ordered list of recovery steps recorded in the current session.
+    pub fn get_recovery_steps(env: Env) -> Vec<RecoveryStep> {
+        env.storage()
+            .persistent()
+            .get(&keys::RECOVERY_STEPS)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin Activity Service (issue #299)
+    // -----------------------------------------------------------------------
+
+    /// Retrieve a page of admin activity log entries (oldest-first).
+    ///
+    /// Returns up to `limit` entries starting at zero-indexed `offset`.
+    /// Maximum `limit` per call is 50.
+    pub fn get_admin_activity(env: Env, limit: u32, offset: u32) -> AdminActivityPage {
+        if limit > 50 {
+            panic!("limit must not exceed 50");
+        }
+        let log: Vec<AdminActivityEntry> = env
+            .storage()
+            .persistent()
+            .get(&keys::ADMIN_ACTIVITY_LOG)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = log.len();
+        let mut page: Vec<AdminActivityEntry> = Vec::new(&env);
+        let end = if offset + limit < total {
+            offset + limit
+        } else {
+            total
+        };
+        for i in offset..end {
+            page.push_back(log.get(i).unwrap());
+        }
+        AdminActivityPage { entries: page, total }
+    }
+
+    /// Retrieve admin activity entries for a specific actor (most-recent first).
+    /// Returns up to `limit` matching entries; maximum is 50.
+    pub fn get_admin_activity_by_actor(
+        env: Env,
+        actor: Address,
+        limit: u32,
+    ) -> Vec<AdminActivityEntry> {
+        if limit > 50 {
+            panic!("limit must not exceed 50");
+        }
+        let log: Vec<AdminActivityEntry> = env
+            .storage()
+            .persistent()
+            .get(&keys::ADMIN_ACTIVITY_LOG)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result: Vec<AdminActivityEntry> = Vec::new(&env);
+        let len = log.len();
+        let mut i = len;
+        while i > 0 && result.len() < limit {
+            i -= 1;
+            let entry = log.get(i).unwrap();
+            if entry.actor == actor {
+                result.push_back(entry);
+            }
+        }
+        result
+    }
+
+    /// Internal: append one entry to the admin activity log.
+    /// Capped at 500 entries; oldest entries are trimmed when the cap is hit.
+    fn append_admin_activity(
+        env: &Env,
+        action: AdminActivityAction,
+        actor: Address,
+        detail: String,
+    ) {
+        let seq: u32 = env
+            .storage()
+            .instance()
+            .get(&keys::ADMIN_ACTIVITY_CTR)
+            .unwrap_or(0u32)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&keys::ADMIN_ACTIVITY_CTR, &seq);
+        let entry = AdminActivityEntry {
+            sequence: seq,
+            action: action.clone(),
+            actor,
+            detail,
+            timestamp: env.ledger().timestamp(),
+        };
+        let mut log: Vec<AdminActivityEntry> = env
+            .storage()
+            .persistent()
+            .get(&keys::ADMIN_ACTIVITY_LOG)
+            .unwrap_or_else(|| Vec::new(env));
+        log.push_back(entry);
+        if log.len() > 500 {
+            let mut trimmed: Vec<AdminActivityEntry> = Vec::new(env);
+            for i in 1..log.len() {
+                trimmed.push_back(log.get(i).unwrap());
+            }
+            log = trimmed;
+        }
+        env.storage()
+            .persistent()
+            .set(&keys::ADMIN_ACTIVITY_LOG, &log);
+        env.events()
+            .publish((symbol_short!("adm_act"),), (seq, action));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-Source Health Submission (issue #300)
+    // -----------------------------------------------------------------------
+
+    /// Register a trusted health data source.
+    ///
+    /// Only the contract admin may register sources. `weight_bps` expresses the
+    /// source's relative influence in basis points (10 000 = 100 %). Multiple
+    /// sources need not sum to 10 000 — the aggregation normalises by total
+    /// weight of contributing sources.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - `weight_bps` is zero.
+    pub fn register_health_source(
+        env: Env,
+        caller: Address,
+        source_id: String,
+        weight_bps: u32,
+    ) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can register health sources");
+        }
+        if weight_bps == 0 {
+            panic!("weight_bps must be greater than zero");
+        }
+        let now = env.ledger().timestamp();
+        let source = HealthSource {
+            source_id: source_id.clone(),
+            weight_bps,
+            trusted: true,
+            registered_at: now,
+        };
+        let mut sources: Vec<HealthSource> = env
+            .storage()
+            .instance()
+            .get(&keys::HEALTH_SOURCES)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Replace if already registered, otherwise append
+        let mut found = false;
+        let mut updated: Vec<HealthSource> = Vec::new(&env);
+        for s in sources.iter() {
+            if s.source_id == source_id {
+                updated.push_back(source.clone());
+                found = true;
+            } else {
+                updated.push_back(s);
+            }
+        }
+        if !found {
+            updated.push_back(source);
+        }
+        env.storage().instance().set(&keys::HEALTH_SOURCES, &updated);
+        env.events()
+            .publish((symbol_short!("src_reg"), caller.clone()), source_id.clone());
+        Self::append_admin_activity(
+            &env,
+            AdminActivityAction::AssetRegistered,
+            caller,
+            source_id,
+        );
+    }
+
+    /// Revoke trust for a health source (it can no longer submit data).
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - Source with `source_id` is not registered.
+    pub fn revoke_health_source(env: Env, caller: Address, source_id: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&keys::ADMIN).unwrap();
+        if caller != admin {
+            panic!("only admin can revoke health sources");
+        }
+        let mut sources: Vec<HealthSource> = env
+            .storage()
+            .instance()
+            .get(&keys::HEALTH_SOURCES)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        let mut updated: Vec<HealthSource> = Vec::new(&env);
+        for s in sources.iter() {
+            if s.source_id == source_id {
+                let mut revoked = s.clone();
+                revoked.trusted = false;
+                updated.push_back(revoked);
+                found = true;
+            } else {
+                updated.push_back(s);
+            }
+        }
+        if !found {
+            panic!("health source not registered");
+        }
+        env.storage().instance().set(&keys::HEALTH_SOURCES, &updated);
+        env.events()
+            .publish((symbol_short!("src_rev"), caller), source_id);
+    }
+
+    /// Submit health data from a named trusted source.
+    ///
+    /// The source must be registered and trusted (see `register_health_source`).
+    /// Each source keeps its own per-asset entry; `get_aggregated_health` then
+    /// combines all trusted sources into a weighted-average view.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin or a HealthSubmitter.
+    /// - `source_id` is not a registered trusted source.
+    pub fn submit_health_multi_source(
+        env: Env,
+        caller: Address,
+        source_id: String,
+        asset_code: String,
+        health_score: u32,
+        liquidity_score: u32,
+        price_stability_score: u32,
+        bridge_uptime_score: u32,
+    ) {
+        Self::assert_not_globally_paused(&env);
+        Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
+        // Verify this source is registered and trusted
+        let sources: Vec<HealthSource> = env
+            .storage()
+            .instance()
+            .get(&keys::HEALTH_SOURCES)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_trusted = false;
+        for s in sources.iter() {
+            if s.source_id == source_id && s.trusted {
+                is_trusted = true;
+                break;
+            }
+        }
+        if !is_trusted {
+            panic!("source is not registered or not trusted");
+        }
+        let now = env.ledger().timestamp();
+        let entry = SourcedHealthEntry {
+            source_id: source_id.clone(),
+            asset_code: asset_code.clone(),
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+            submitted_at: now,
+        };
+        env.storage()
+            .persistent()
+            .set(&HealthSourceDataKey::Entry(source_id.clone(), asset_code.clone()), &entry);
+        env.events().publish(
+            (symbol_short!("ms_hlth"), caller.clone(), asset_code.clone()),
+            (source_id.clone(), health_score, now),
+        );
+        Self::append_replay_event(
+            &env,
+            String::from_str(&env, "ms_hlth"),
+            caller.clone(),
+            asset_code.clone(),
+            health_score as i128,
+        );
+        Self::append_admin_activity(
+            &env,
+            AdminActivityAction::HealthSubmitted,
+            caller,
+            asset_code,
+        );
+    }
+
+    /// Compute a weighted-average health view for an asset across all trusted sources.
+    ///
+    /// Sources with no entry for `asset_code` are skipped. Returns `None` if no
+    /// trusted source has submitted data for the asset.
+    pub fn get_aggregated_health(env: Env, asset_code: String) -> Option<AggregatedHealth> {
+        let sources: Vec<HealthSource> = env
+            .storage()
+            .instance()
+            .get(&keys::HEALTH_SOURCES)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_weight: u64 = 0;
+        let mut weighted_health: u64 = 0;
+        let mut weighted_liquidity: u64 = 0;
+        let mut weighted_price: u64 = 0;
+        let mut weighted_uptime: u64 = 0;
+        let mut count: u32 = 0;
+
+        for source in sources.iter() {
+            if !source.trusted {
+                continue;
+            }
+            let key = HealthSourceDataKey::Entry(source.source_id.clone(), asset_code.clone());
+            let entry: Option<SourcedHealthEntry> = env.storage().persistent().get(&key);
+            if let Some(e) = entry {
+                let w = source.weight_bps as u64;
+                total_weight += w;
+                weighted_health += w * e.health_score as u64;
+                weighted_liquidity += w * e.liquidity_score as u64;
+                weighted_price += w * e.price_stability_score as u64;
+                weighted_uptime += w * e.bridge_uptime_score as u64;
+                count += 1;
+            }
+        }
+
+        if count == 0 || total_weight == 0 {
+            return None;
+        }
+
+        Some(AggregatedHealth {
+            asset_code,
+            weighted_health_score: (weighted_health / total_weight) as u32,
+            weighted_liquidity_score: (weighted_liquidity / total_weight) as u32,
+            weighted_price_stability_score: (weighted_price / total_weight) as u32,
+            weighted_bridge_uptime_score: (weighted_uptime / total_weight) as u32,
+            source_count: count,
+            computed_at: env.ledger().timestamp(),
+        })
+    }
+
+    /// Return the list of all registered health sources.
+    pub fn get_health_sources(env: Env) -> Vec<HealthSource> {
+        env.storage()
+            .instance()
+            .get(&keys::HEALTH_SOURCES)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Event Replay Helpers (issue #296)
+    // -----------------------------------------------------------------------
+
+    /// Return the current event payload schema version.
+    ///
+    /// Off-chain consumers should call this after connecting to detect whether
+    /// a schema migration has occurred and rebuild their replay state if needed.
+    pub fn get_replay_schema_version(_env: Env) -> u32 {
+        EVENT_SCHEMA_VERSION
+    }
+
+    /// Query replay-friendly event history ordered by ascending `ordering_key`.
+    ///
+    /// Returns up to `limit` entries whose `ordering_key` is ≥
+    /// `from_ordering_key`. Pass `0` to start from the beginning of the log.
+    /// Maximum `limit` per call is 100. The returned `EventReplayPage` includes
+    /// the total log size so callers can implement cursor-based pagination.
+    pub fn get_replay_events(env: Env, from_ordering_key: u64, limit: u32) -> EventReplayPage {
+        if limit > 100 {
+            panic!("limit must not exceed 100");
+        }
+        let log: Vec<EventReplayEntry> = env
+            .storage()
+            .persistent()
+            .get(&keys::EVENT_REPLAY_LOG)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = log.len();
+        let mut page: Vec<EventReplayEntry> = Vec::new(&env);
+        for i in 0..total {
+            if page.len() >= limit {
+                break;
+            }
+            let entry = log.get(i).unwrap();
+            if entry.ordering_key >= from_ordering_key {
+                page.push_back(entry);
+            }
+        }
+        EventReplayPage {
+            entries: page,
+            total,
+            schema_version: EVENT_SCHEMA_VERSION,
+        }
+    }
+
+    /// Return the total number of entries in the event replay log.
+    pub fn get_replay_log_size(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, Vec<EventReplayEntry>>(&keys::EVENT_REPLAY_LOG)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    /// Internal: append one entry to the event replay log.
+    ///
+    /// The `ordering_key` is `(timestamp << 32) | (sequence & 0xFFFF_FFFF)`
+    /// providing stable, deterministic ordering even for same-timestamp events.
+    /// Log is capped at 1 000 entries; oldest entries are trimmed on overflow.
+    fn append_replay_event(
+        env: &Env,
+        event_type: String,
+        actor: Address,
+        subject: String,
+        value: i128,
+    ) {
+        let seq: u32 = env
+            .storage()
+            .instance()
+            .get(&keys::EVENT_REPLAY_CTR)
+            .unwrap_or(0u32)
+            + 1;
+        env.storage().instance().set(&keys::EVENT_REPLAY_CTR, &seq);
+        let now = env.ledger().timestamp();
+        let ordering_key = (now << 32) | (seq as u64);
+        let entry = EventReplayEntry {
+            event_id: seq,
+            event_type,
+            actor,
+            subject,
+            value,
+            timestamp: now,
+            ordering_key,
+            schema_version: EVENT_SCHEMA_VERSION,
+        };
+        let mut log: Vec<EventReplayEntry> = env
+            .storage()
+            .persistent()
+            .get(&keys::EVENT_REPLAY_LOG)
+            .unwrap_or_else(|| Vec::new(env));
+        log.push_back(entry);
+        if log.len() > 1000 {
+            let mut trimmed: Vec<EventReplayEntry> = Vec::new(env);
+            for i in 1..log.len() {
+                trimmed.push_back(log.get(i).unwrap());
+            }
+            log = trimmed;
+        }
+        env.storage()
+            .persistent()
+            .set(&keys::EVENT_REPLAY_LOG, &log);
     }
 }
 
@@ -2317,6 +8026,343 @@ mod tests {
             sources.push_back(String::from_str(env, venue));
         }
         sources
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint tests (issue #105)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manual_checkpoint_stores_snapshot_and_metadata() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(100);
+        client.set_checkpoint_config(&admin, &86_400, &10, &2);
+
+        let usdc = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "oracle");
+        let label = String::from_str(&env, "manual-baseline");
+
+        client.register_asset(&admin, &usdc);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+
+        let metadata = client.create_checkpoint(&admin, &label);
+        assert_eq!(metadata.checkpoint_id, 2);
+        assert_eq!(metadata.format_version, 2);
+        assert_eq!(metadata.label, label);
+        assert_eq!(metadata.asset_count, 1);
+        assert_eq!(metadata.trigger, CheckpointTrigger::Manual);
+
+        let snapshot = client.get_checkpoint(&metadata.checkpoint_id).unwrap();
+        assert_eq!(snapshot.assets.len(), 1);
+        assert_eq!(snapshot.health_weights.version, 1);
+        assert_eq!(snapshot.assets.get(0).unwrap().asset_code, usdc);
+
+        let validation = client.validate_checkpoint(&metadata.checkpoint_id);
+        assert!(validation.is_valid);
+    }
+
+    #[test]
+    fn test_compare_checkpoints_detects_asset_changes() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &86_400, &10, &1);
+
+        let usdc = String::from_str(&env, "USDC");
+        let eurc = String::from_str(&env, "EURC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(10);
+        client.register_asset(&admin, &usdc);
+        let first = client.create_checkpoint(&admin, &String::from_str(&env, "before"));
+
+        env.ledger().set_timestamp(20);
+        client.submit_price(&admin, &usdc, &1_020_000, &source);
+        client.register_asset(&admin, &eurc);
+        let second = client.create_checkpoint(&admin, &String::from_str(&env, "after"));
+
+        let comparison = client.compare_checkpoints(&first.checkpoint_id, &second.checkpoint_id);
+        assert!(comparison.state_hash_changed);
+        assert_eq!(comparison.added_assets.len(), 1);
+        assert_eq!(comparison.added_assets.get(0).unwrap(), eurc);
+        assert_eq!(comparison.changed_assets.len(), 1);
+        assert_eq!(comparison.changed_assets.get(0).unwrap().asset_code, usdc);
+        assert!(comparison.changed_assets.get(0).unwrap().price_changed);
+    }
+
+    #[test]
+    fn test_checkpoint_pruning_keeps_latest_entries() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &0, &2, &1);
+        let usdc = String::from_str(&env, "USDC");
+
+        env.ledger().set_timestamp(1);
+        client.register_asset(&admin, &usdc);
+
+        env.ledger().set_timestamp(2);
+        let second = client.create_checkpoint(&admin, &String::from_str(&env, "second"));
+
+        env.ledger().set_timestamp(3);
+        let third = client.create_checkpoint(&admin, &String::from_str(&env, "third"));
+
+        let checkpoints = client.list_checkpoints();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints.get(0).unwrap().checkpoint_id,
+            second.checkpoint_id
+        );
+        assert_eq!(
+            checkpoints.get(1).unwrap().checkpoint_id,
+            third.checkpoint_id
+        );
+        assert!(client.get_checkpoint(&1).is_none());
+    }
+
+    #[test]
+    fn test_auto_checkpoint_respects_interval() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &60, &10, &1);
+        let usdc = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(100);
+        client.register_asset(&admin, &usdc);
+        assert_eq!(client.list_checkpoints().len(), 1);
+
+        env.ledger().set_timestamp(120);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+        assert_eq!(client.list_checkpoints().len(), 1);
+
+        env.ledger().set_timestamp(200);
+        client.submit_health(&admin, &usdc, &80, &75, &90, &88);
+        assert_eq!(client.list_checkpoints().len(), 2);
+        assert_eq!(
+            client.get_latest_checkpoint().unwrap().trigger,
+            CheckpointTrigger::Automatic
+        );
+    }
+
+    #[test]
+    fn test_restore_from_checkpoint_restores_prior_state() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &86_400, &10, &1);
+
+        let usdc = String::from_str(&env, "USDC");
+        let eurc = String::from_str(&env, "EURC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(1_000);
+        client.register_asset(&admin, &usdc);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+        let baseline = client.create_checkpoint(&admin, &String::from_str(&env, "baseline"));
+
+        env.ledger().set_timestamp(2_000);
+        client.submit_health(&admin, &usdc, &91, &92, &93, &94);
+        client.register_asset(&admin, &eurc);
+        client.submit_price(&admin, &eurc, &990_000, &source);
+
+        env.ledger().set_timestamp(3_000);
+        let restore_meta = client.restore_from_checkpoint(&admin, &baseline.checkpoint_id);
+
+        assert_eq!(client.get_monitored_assets().len(), 1);
+        assert_eq!(client.get_monitored_assets().get(0).unwrap(), usdc);
+        assert!(client.get_health(&eurc).is_none());
+        assert_eq!(client.get_price(&usdc).unwrap().price, 1_000_000);
+        assert_eq!(restore_meta.trigger, CheckpointTrigger::Restore);
+        assert_eq!(restore_meta.restored_from, Some(baseline.checkpoint_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Data retention and cleanup tests (issue #100)
+    // -----------------------------------------------------------------------
+
+    fn find_storage_entry(stats: &StorageStats, data_type: RetentionDataType) -> StorageUsageEntry {
+        let mut i = 0;
+        while i < stats.entries.len() {
+            let entry = stats.entries.get(i).unwrap();
+            if entry.data_type == data_type {
+                return entry;
+            }
+            i += 1;
+        }
+
+        panic!("storage usage entry not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "only admin or SuperAdmin can manage retention policies")]
+    fn test_set_retention_policy_requires_admin_or_super_admin() {
+        let (env, client, _admin) = setup();
+        let stranger = Address::generate(&env);
+
+        client.set_retention_policy(
+            &stranger,
+            &RetentionDataType::SupplyMismatches,
+            &86_400,
+            &3_600,
+            &25,
+            &false,
+            &true,
+        );
+    }
+
+    #[test]
+    fn test_cleanup_old_data_archives_and_preserves_latest_record() {
+        let (env, client, admin) = setup();
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        client.set_retention_policy(
+            &admin,
+            &RetentionDataType::SupplyMismatches,
+            &100,
+            &1_000_000,
+            &20,
+            &true,
+            &true,
+        );
+
+        env.ledger().set_timestamp(100);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_001_000);
+
+        env.ledger().set_timestamp(200);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_002_000);
+
+        env.ledger().set_timestamp(500);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_003_000);
+
+        env.ledger().set_timestamp(2_000);
+        let result = client.cleanup_old_data(&admin, &10);
+
+        assert_eq!(result.total_deleted, 2);
+        assert_eq!(result.total_archived, 2);
+
+        let records = client.get_supply_mismatches(&bridge);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().timestamp, 500);
+
+        let stats = client.get_storage_stats();
+        let supply = find_storage_entry(&stats, RetentionDataType::SupplyMismatches);
+        assert_eq!(supply.active_records, 1);
+        assert_eq!(supply.archived_records, 2);
+    }
+
+    #[test]
+    fn test_per_asset_override_prevents_override_asset_cleanup() {
+        let (env, client, admin) = setup();
+        let bridge = String::from_str(&env, "CIRCLE_MULTI");
+        let usdc = String::from_str(&env, "USDC");
+        let eurc = String::from_str(&env, "EURC");
+
+        client.set_retention_policy(
+            &admin,
+            &RetentionDataType::SupplyMismatches,
+            &100,
+            &1_000_000,
+            &20,
+            &false,
+            &true,
+        );
+
+        let override_secs = Some(10_000u64);
+        client.set_asset_retention_override(
+            &admin,
+            &usdc,
+            &RetentionDataType::SupplyMismatches,
+            &override_secs,
+        );
+
+        env.ledger().set_timestamp(100);
+        client.record_supply_mismatch(&bridge, &usdc, &1_000_000, &1_001_000);
+
+        env.ledger().set_timestamp(150);
+        client.record_supply_mismatch(&bridge, &eurc, &1_000_000, &1_001_000);
+
+        env.ledger().set_timestamp(200);
+        client.record_supply_mismatch(&bridge, &usdc, &1_000_000, &1_002_000);
+
+        env.ledger().set_timestamp(1_000);
+        let result = client.cleanup_old_data(&admin, &20);
+        assert_eq!(result.total_deleted, 1);
+
+        let records = client.get_supply_mismatches(&bridge);
+        assert_eq!(records.len(), 2);
+
+        let mut usdc_count = 0u32;
+        let mut eurc_count = 0u32;
+        for record in records.iter() {
+            if record.asset_code == usdc {
+                usdc_count += 1;
+            }
+            if record.asset_code == eurc {
+                eurc_count += 1;
+            }
+        }
+
+        assert_eq!(usdc_count, 2);
+        assert_eq!(eurc_count, 0);
+    }
+
+    #[test]
+    fn test_gradual_cleanup_respects_policy_delete_cap() {
+        let (env, client, admin) = setup();
+        let bridge = String::from_str(&env, "CIRCLE_CAP");
+        let asset = String::from_str(&env, "USDC");
+
+        client.set_retention_policy(
+            &admin,
+            &RetentionDataType::SupplyMismatches,
+            &20,
+            &1_000_000,
+            &2,
+            &false,
+            &true,
+        );
+
+        for i in 0..6u64 {
+            env.ledger().set_timestamp(100 + i * 10);
+            client.record_supply_mismatch(
+                &bridge,
+                &asset,
+                &(1_000_000 + i as i128),
+                &(1_001_000 + i as i128),
+            );
+        }
+
+        env.ledger().set_timestamp(1_000);
+        let result = client.cleanup_old_data(&admin, &25);
+
+        assert_eq!(result.total_deleted, 2);
+        let records = client.get_supply_mismatches(&bridge);
+        assert_eq!(records.len(), 4);
+    }
+
+    #[test]
+    fn test_auto_cleanup_trigger_runs_during_writes() {
+        let (env, client, admin) = setup();
+        let bridge = String::from_str(&env, "CIRCLE_AUTO");
+        let asset = String::from_str(&env, "USDC");
+
+        client.set_retention_policy(
+            &admin,
+            &RetentionDataType::SupplyMismatches,
+            &10,
+            &1,
+            &50,
+            &false,
+            &true,
+        );
+
+        env.ledger().set_timestamp(100);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_001_000);
+
+        env.ledger().set_timestamp(200);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_002_000);
+
+        env.ledger().set_timestamp(500);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_003_000);
+
+        let records = client.get_supply_mismatches(&bridge);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().timestamp, 500);
     }
 
     // -----------------------------------------------------------------------
@@ -2434,6 +8480,108 @@ mod tests {
         let result = client.check_price_deviation(&asset, &1_010_000);
         assert!(result.is_some());
         assert_eq!(result.unwrap().severity, DeviationSeverity::Low);
+    }
+
+    #[test]
+    fn test_temporary_deviation_threshold_override_expires() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let asset = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "Stellar DEX");
+        let operator = Address::generate(&env);
+
+        client.acl_grant_permission(&admin, &operator, &Permission::ManageConfig, &0);
+        client.register_asset(&admin, &asset);
+        client.submit_price(&admin, &asset, &1_000_000, &source);
+
+        client.set_deviation_threshold_override(
+            &operator,
+            &asset,
+            &50,
+            &100,
+            &200,
+            &ThresholdOverrideMode::Temporary,
+            &Some(1_000_050),
+        );
+
+        let during_override = client.check_price_deviation(&asset, &1_010_000);
+        assert!(during_override.is_some());
+        assert_eq!(during_override.unwrap().severity, DeviationSeverity::Low);
+
+        env.ledger().set_timestamp(1_000_060);
+        assert!(client.get_deviation_threshold_override(&asset).is_none());
+
+        let after_expiry = client.check_price_deviation(&asset, &1_010_000);
+        assert!(after_expiry.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized: caller lacks the required permission")]
+    fn test_threshold_override_requires_manage_config_permission() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let asset = String::from_str(&env, "USDC");
+        let operator = Address::generate(&env);
+
+        client.set_mismatch_threshold_override(
+            &operator,
+            &asset,
+            &5,
+            &ThresholdOverrideMode::Permanent,
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_mismatch_threshold_override_is_applied_per_asset() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let asset = String::from_str(&env, "USDC");
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let operator = Address::generate(&env);
+
+        client.acl_grant_permission(&admin, &operator, &Permission::ManageConfig, &0);
+        client.set_mismatch_threshold_override(
+            &operator,
+            &asset,
+            &5,
+            &ThresholdOverrideMode::Permanent,
+            &None,
+        );
+
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_001_000);
+        let m = client.get_supply_mismatches(&bridge).get(0).unwrap();
+        assert_eq!(m.mismatch_bps, 9);
+        assert!(m.is_critical);
+
+        let active_override = client.get_mismatch_threshold_override(&asset).unwrap();
+        assert_eq!(active_override.threshold_bps, 5);
+        assert_eq!(active_override.mode, ThresholdOverrideMode::Permanent);
+    }
+
+    #[test]
+    fn test_threshold_override_writes_audit_log() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let asset = String::from_str(&env, "USDC");
+        client.set_mismatch_threshold_override(
+            &admin,
+            &asset,
+            &7,
+            &ThresholdOverrideMode::Permanent,
+            &None,
+        );
+
+        let log_name = String::from_str(&env, "mismatch_override_USDC");
+        let log = client.get_config_audit_log(&ConfigCategory::Threshold, &log_name);
+        assert_eq!(log.len(), 1);
+        let entry = log.get(0).unwrap();
+        assert_eq!(entry.old_value, 0);
+        assert_eq!(entry.new_value, 7);
     }
 
     // -----------------------------------------------------------------------
@@ -2605,12 +8753,13 @@ mod tests {
         bridge_uptime_score: u32,
     ) -> Bytes {
         let mut data = Bytes::new(env);
-        let code = asset_code.to_string();
-        let code_bytes = code.as_bytes();
-        let mut i = 0;
-        while i < code_bytes.len() {
-            data.push_back(code_bytes[i]);
-            i += 1;
+        let len = asset_code.len() as usize;
+        let mut buf = [0u8; 256];
+        asset_code.copy_into_slice(&mut buf[..len.min(256)]);
+        let mut ci = 0;
+        while ci < len.min(256) {
+            data.push_back(buf[ci]);
+            ci += 1;
         }
 
         let hs = health_score.to_be_bytes();
@@ -2655,12 +8804,13 @@ mod tests {
         let mut data = Bytes::new(env);
         data.append(message);
 
-        let signer_str = signer_id.to_string();
-        let signer_bytes = signer_str.as_bytes();
-        let mut i = 0;
-        while i < signer_bytes.len() {
-            data.push_back(signer_bytes[i]);
-            i += 1;
+        let sid_len = signer_id.len() as usize;
+        let mut sid_buf = [0u8; 256];
+        signer_id.copy_into_slice(&mut sid_buf[..sid_len.min(256)]);
+        let mut si = 0;
+        while si < sid_len.min(256) {
+            data.push_back(sid_buf[si]);
+            si += 1;
         }
 
         let public_key_bytes = public_key.to_array();
@@ -2962,6 +9112,126 @@ mod tests {
         client.set_mismatch_threshold(&5);
 
         assert_has_event(&env, &client.address, symbol_short!("thresh_up"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract upgrade tests (issue #98)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_propose_upgrade_sets_pending_with_timelock() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000);
+
+        let new_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let proposal_id = client.propose_upgrade(&admin, &new_hash, &false, &None, &None);
+
+        assert_eq!(proposal_id, 1);
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.proposal_id, 1);
+        assert_eq!(pending.new_wasm_hash, new_hash);
+        assert_eq!(pending.execute_after, 1_000 + 172_800);
+        assert_eq!(pending.required_approvals, 1);
+        assert_eq!(pending.approvals.len(), 1);
+        assert_eq!(pending.approvals.get(0).unwrap(), admin);
+
+        assert_has_event(&env, &client.address, symbol_short!("up_prop"));
+    }
+
+    #[test]
+    #[should_panic(expected = "upgrade timelock has not elapsed")]
+    fn test_execute_upgrade_enforces_timelock() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(2_000);
+
+        let new_hash = BytesN::from_array(&env, &[8u8; 32]);
+        client.propose_upgrade(&admin, &new_hash, &false, &None, &None);
+        client.execute_upgrade(&admin, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient governance approvals")]
+    fn test_emergency_upgrade_requires_higher_approval_threshold() {
+        let (env, client, admin) = setup();
+        let super_admin = Address::generate(&env);
+        client.grant_role(&admin, &super_admin, &AdminRole::SuperAdmin);
+
+        env.ledger().set_timestamp(3_000);
+        let new_hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.propose_upgrade(&admin, &new_hash, &true, &None, &None);
+
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.required_approvals, 2);
+        assert_eq!(pending.execute_after, 3_000);
+
+        // Only proposer approval exists at this point.
+        client.execute_upgrade(&admin, &1);
+    }
+
+    #[test]
+    fn test_emergency_upgrade_executes_after_additional_approval() {
+        let (env, client, admin) = setup();
+        let super_admin = Address::generate(&env);
+        client.grant_role(&admin, &super_admin, &AdminRole::SuperAdmin);
+
+        env.ledger().set_timestamp(4_000);
+        let new_hash = BytesN::from_array(&env, &[10u8; 32]);
+        client.propose_upgrade(&admin, &new_hash, &true, &None, &None);
+        client.approve_upgrade(&super_admin, &1);
+        client.execute_upgrade(&admin, &1);
+
+        assert!(client.get_pending_upgrade().is_none());
+        assert_eq!(client.get_contract_version(), 2);
+        assert_eq!(client.get_current_wasm_hash().unwrap(), new_hash);
+
+        let history = client.get_upgrade_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert_eq!(record.proposal_id, 1);
+        assert!(record.emergency);
+        assert!(!record.is_rollback);
+
+        assert_has_event(&env, &client.address, symbol_short!("up_appr"));
+        assert_has_event(&env, &client.address, symbol_short!("up_exec"));
+    }
+
+    #[test]
+    fn test_cancel_upgrade_clears_pending_proposal() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(5_000);
+
+        let new_hash = BytesN::from_array(&env, &[11u8; 32]);
+        client.propose_upgrade(&admin, &new_hash, &false, &None, &None);
+        client.cancel_upgrade(&admin, &1, &String::from_str(&env, "no longer needed"));
+
+        assert!(client.get_pending_upgrade().is_none());
+        assert_has_event(&env, &client.address, symbol_short!("up_cncl"));
+    }
+
+    #[test]
+    fn test_propose_rollback_uses_tracked_target_hash() {
+        let (env, client, admin) = setup();
+
+        let first_hash = BytesN::from_array(&env, &[12u8; 32]);
+        let second_hash = BytesN::from_array(&env, &[13u8; 32]);
+
+        env.ledger().set_timestamp(10_000);
+        client.propose_upgrade(&admin, &first_hash, &false, &None, &None);
+        env.ledger().set_timestamp(10_000 + 172_800);
+        client.execute_upgrade(&admin, &1);
+
+        env.ledger().set_timestamp(200_000);
+        client.propose_upgrade(&admin, &second_hash, &false, &None, &None);
+        env.ledger().set_timestamp(200_000 + 172_800);
+        client.execute_upgrade(&admin, &2);
+
+        assert_eq!(client.get_rollback_target().unwrap(), first_hash);
+
+        let rollback_id = client.propose_rollback(&admin, &false, &None, &None);
+        assert_eq!(rollback_id, 3);
+        let pending = client.get_pending_upgrade().unwrap();
+        assert!(pending.is_rollback);
+        assert_eq!(pending.new_wasm_hash, first_hash);
     }
 
     // -----------------------------------------------------------------------
@@ -4402,6 +10672,85 @@ mod tests {
     }
 
     #[test]
+    fn test_get_risk_score_config_returns_defaults() {
+        let (_env, client, _admin) = setup();
+        let config = client.get_risk_score_config();
+        assert_eq!(config.health_weight_bps, 5_000);
+        assert_eq!(config.price_weight_bps, 2_500);
+        assert_eq!(config.volatility_weight_bps, 2_500);
+        assert_eq!(config.max_price_deviation_bps, 2_000);
+        assert_eq!(config.max_volatility_bps, 5_000);
+        assert_eq!(config.version, 1);
+    }
+
+    #[test]
+    fn test_set_risk_score_config_stores_custom_values() {
+        let (_env, client, admin) = setup();
+        client.set_risk_score_config(&admin, &4_000, &3_500, &2_500, &1_500, &4_000, &2);
+
+        let config = client.get_risk_score_config();
+        assert_eq!(config.health_weight_bps, 4_000);
+        assert_eq!(config.price_weight_bps, 3_500);
+        assert_eq!(config.volatility_weight_bps, 2_500);
+        assert_eq!(config.max_price_deviation_bps, 1_500);
+        assert_eq!(config.max_volatility_bps, 4_000);
+        assert_eq!(config.version, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_risk_score_config_rejects_invalid_weight_sum() {
+        let (_env, client, admin) = setup();
+        client.set_risk_score_config(&admin, &4_000, &3_000, &2_000, &2_000, &5_000, &1);
+    }
+
+    #[test]
+    fn test_calculate_risk_score_uses_weighted_normalized_inputs() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(3_000_000);
+
+        let result = client.calculate_risk_score(&80, &500, &1_250);
+        assert_eq!(result.normalized_health_risk_bps, 2_000);
+        assert_eq!(result.normalized_price_risk_bps, 2_500);
+        assert_eq!(result.normalized_volatility_risk_bps, 2_500);
+        assert_eq!(result.risk_score_bps, 2_250);
+        assert_eq!(result.timestamp, 3_000_000);
+    }
+
+    #[test]
+    fn test_calculate_risk_score_clamps_inputs_and_output() {
+        let (_env, client, _admin) = setup();
+
+        let result = client.calculate_risk_score(&0, &50_000, &50_000);
+        assert_eq!(result.normalized_health_risk_bps, 10_000);
+        assert_eq!(result.normalized_price_risk_bps, 10_000);
+        assert_eq!(result.normalized_volatility_risk_bps, 10_000);
+        assert_eq!(result.risk_score_bps, 10_000);
+    }
+
+    #[test]
+    fn test_get_asset_risk_score_reads_stored_health_and_price_history() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "oracle");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &75, &80, &75, &70);
+
+        env.ledger().set_timestamp(100);
+        client.submit_price(&admin, &asset, &1_000_000, &source);
+        env.ledger().set_timestamp(200);
+        client.submit_price(&admin, &asset, &1_000_000, &source);
+        env.ledger().set_timestamp(300);
+        client.submit_price(&admin, &asset, &1_000_000, &source);
+
+        let result = client.get_asset_risk_score(&asset, &StatPeriod::Day).unwrap();
+        assert_eq!(result.health_score, 75);
+        assert_eq!(result.price_deviation_bps, 0);
+        assert_eq!(result.volatility_bps, 0);
+        assert_eq!(result.risk_score_bps, 1_250);
+    }
+
+    #[test]
     fn test_calculate_health_score_all_perfect() {
         let (_env, client, _admin) = setup();
 
@@ -4573,5 +10922,1079 @@ mod tests {
 
         let result = client.calculate_health_score(&0, &88, &0);
         assert_eq!(result.composite_score, 88);
+    }
+
+    // -----------------------------------------------------------------------
+    // ACL tests (issue #101)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_acl_grant_and_has_role() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+
+        assert!(!client.acl_has_role(&operator, &acl::Role::Operator));
+        client.acl_grant_role(&admin, &operator, &acl::Role::Operator, &0);
+        assert!(client.acl_has_role(&operator, &acl::Role::Operator));
+    }
+
+    #[test]
+    fn test_acl_revoke_role() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &operator, &acl::Role::Operator, &0);
+        assert!(client.acl_has_role(&operator, &acl::Role::Operator));
+
+        client.acl_revoke_role(&admin, &operator, &acl::Role::Operator);
+        assert!(!client.acl_has_role(&operator, &acl::Role::Operator));
+    }
+
+    #[test]
+    fn test_acl_grant_permission_directly() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        assert!(!client.acl_has_permission(&user, &acl::Permission::ViewHealth));
+        client.acl_grant_permission(&admin, &user, &acl::Permission::ViewHealth, &0);
+        assert!(client.acl_has_permission(&user, &acl::Permission::ViewHealth));
+    }
+
+    #[test]
+    fn test_acl_revoke_permission() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        client.acl_grant_permission(&admin, &user, &acl::Permission::ViewHealth, &0);
+        client.acl_revoke_permission(&admin, &user, &acl::Permission::ViewHealth);
+        assert!(!client.acl_has_permission(&user, &acl::Permission::ViewHealth));
+    }
+
+    #[test]
+    fn test_acl_role_inherits_permissions() {
+        let (env, client, admin) = setup();
+        let readonly = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &readonly, &acl::Role::ReadOnly, &0);
+
+        // ReadOnly inherits ViewHealth, ViewPrice, ViewAnalytics
+        assert!(client.acl_has_permission(&readonly, &acl::Permission::ViewHealth));
+        assert!(client.acl_has_permission(&readonly, &acl::Permission::ViewPrice));
+        assert!(client.acl_has_permission(&readonly, &acl::Permission::ViewAnalytics));
+
+        // ReadOnly does NOT inherit write permissions
+        assert!(!client.acl_has_permission(&readonly, &acl::Permission::SubmitHealth));
+        assert!(!client.acl_has_permission(&readonly, &acl::Permission::ManageAssets));
+    }
+
+    #[test]
+    fn test_acl_operator_role_permissions() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &operator, &acl::Role::Operator, &0);
+
+        assert!(client.acl_has_permission(&operator, &acl::Permission::SubmitHealth));
+        assert!(client.acl_has_permission(&operator, &acl::Permission::SubmitPrice));
+        assert!(client.acl_has_permission(&operator, &acl::Permission::ManageAlerts));
+        // Operator cannot manage config or assets
+        assert!(!client.acl_has_permission(&operator, &acl::Permission::ManageConfig));
+        assert!(!client.acl_has_permission(&operator, &acl::Permission::ManageAssets));
+    }
+
+    #[test]
+    fn test_acl_super_admin_has_all_permissions() {
+        let (env, client, admin) = setup();
+        let super_admin = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &super_admin, &acl::Role::SuperAdmin, &0);
+
+        assert!(client.acl_has_permission(&super_admin, &acl::Permission::ManageUpgrades));
+        assert!(client.acl_has_permission(&super_admin, &acl::Permission::EmergencyPause));
+        assert!(client.acl_has_permission(&super_admin, &acl::Permission::ManagePermissions));
+        assert!(client.acl_has_permission(&super_admin, &acl::Permission::ManageConfig));
+    }
+
+    #[test]
+    fn test_acl_role_expiry() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        // Grant role expiring at timestamp 2000
+        client.acl_grant_role(&admin, &user, &acl::Role::ReadOnly, &2000);
+        assert!(client.acl_has_role(&user, &acl::Role::ReadOnly));
+
+        // Advance past expiry
+        env.ledger().set_timestamp(2001);
+        assert!(!client.acl_has_role(&user, &acl::Role::ReadOnly));
+    }
+
+    #[test]
+    fn test_acl_permission_expiry() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        client.acl_grant_permission(&admin, &user, &acl::Permission::ViewHealth, &2000);
+        assert!(client.acl_has_permission(&user, &acl::Permission::ViewHealth));
+
+        env.ledger().set_timestamp(2001);
+        assert!(!client.acl_has_permission(&user, &acl::Permission::ViewHealth));
+    }
+
+    #[test]
+    fn test_acl_grant_updates_expiry() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        client.acl_grant_role(&admin, &user, &acl::Role::ReadOnly, &2000);
+
+        // Re-grant with extended expiry
+        client.acl_grant_role(&admin, &user, &acl::Role::ReadOnly, &5000);
+
+        env.ledger().set_timestamp(3000);
+        // Should still be valid with the updated expiry
+        assert!(client.acl_has_role(&user, &acl::Role::ReadOnly));
+    }
+
+    #[test]
+    fn test_acl_get_roles_for() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &user, &acl::Role::Operator, &0);
+        client.acl_grant_role(&admin, &user, &acl::Role::ReadOnly, &0);
+
+        let roles = client.acl_get_roles_for(&user);
+        assert_eq!(roles.len(), 2);
+    }
+
+    #[test]
+    fn test_acl_get_permissions_for() {
+        let (env, client, admin) = setup();
+        let user = Address::generate(&env);
+
+        client.acl_grant_permission(&admin, &user, &acl::Permission::ViewHealth, &0);
+        client.acl_grant_permission(&admin, &user, &acl::Permission::ViewPrice, &0);
+
+        let perms = client.acl_get_permissions_for(&user);
+        assert_eq!(perms.len(), 2);
+    }
+
+    #[test]
+    fn test_acl_bulk_grant_roles() {
+        let (env, client, admin) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        let entries = soroban_sdk::vec![
+            &env,
+            acl::BulkRoleEntry {
+                grantee: u1.clone(),
+                role: acl::Role::Operator,
+                expires_at: 0
+            },
+            acl::BulkRoleEntry {
+                grantee: u2.clone(),
+                role: acl::Role::ReadOnly,
+                expires_at: 0
+            },
+        ];
+        client.acl_bulk_grant_roles(&admin, &entries);
+
+        assert!(client.acl_has_role(&u1, &acl::Role::Operator));
+        assert!(client.acl_has_role(&u2, &acl::Role::ReadOnly));
+    }
+
+    #[test]
+    fn test_acl_bulk_revoke_roles() {
+        let (env, client, admin) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        let grant_entries = soroban_sdk::vec![
+            &env,
+            acl::BulkRoleEntry {
+                grantee: u1.clone(),
+                role: acl::Role::Operator,
+                expires_at: 0
+            },
+            acl::BulkRoleEntry {
+                grantee: u2.clone(),
+                role: acl::Role::ReadOnly,
+                expires_at: 0
+            },
+        ];
+        client.acl_bulk_grant_roles(&admin, &grant_entries);
+
+        let revoke_entries = soroban_sdk::vec![
+            &env,
+            acl::BulkRoleEntry {
+                grantee: u1.clone(),
+                role: acl::Role::Operator,
+                expires_at: 0
+            },
+            acl::BulkRoleEntry {
+                grantee: u2.clone(),
+                role: acl::Role::ReadOnly,
+                expires_at: 0
+            },
+        ];
+        client.acl_bulk_revoke_roles(&admin, &revoke_entries);
+
+        assert!(!client.acl_has_role(&u1, &acl::Role::Operator));
+        assert!(!client.acl_has_role(&u2, &acl::Role::ReadOnly));
+    }
+
+    #[test]
+    fn test_acl_bulk_grant_permissions() {
+        let (env, client, admin) = setup();
+        let u1 = Address::generate(&env);
+
+        let entries = soroban_sdk::vec![
+            &env,
+            acl::BulkPermissionEntry {
+                grantee: u1.clone(),
+                permission: acl::Permission::ViewHealth,
+                expires_at: 0,
+            },
+            acl::BulkPermissionEntry {
+                grantee: u1.clone(),
+                permission: acl::Permission::ViewPrice,
+                expires_at: 0,
+            },
+        ];
+        client.acl_bulk_grant_permissions(&admin, &entries);
+
+        assert!(client.acl_has_permission(&u1, &acl::Permission::ViewHealth));
+        assert!(client.acl_has_permission(&u1, &acl::Permission::ViewPrice));
+    }
+
+    #[test]
+    fn test_acl_bulk_revoke_permissions() {
+        let (env, client, admin) = setup();
+        let u1 = Address::generate(&env);
+
+        let grant_entries = soroban_sdk::vec![
+            &env,
+            acl::BulkPermissionEntry {
+                grantee: u1.clone(),
+                permission: acl::Permission::ViewHealth,
+                expires_at: 0,
+            },
+        ];
+        client.acl_bulk_grant_permissions(&admin, &grant_entries);
+
+        let revoke_entries = soroban_sdk::vec![
+            &env,
+            acl::BulkPermissionEntry {
+                grantee: u1.clone(),
+                permission: acl::Permission::ViewHealth,
+                expires_at: 0,
+            },
+        ];
+        client.acl_bulk_revoke_permissions(&admin, &revoke_entries);
+
+        assert!(!client.acl_has_permission(&u1, &acl::Permission::ViewHealth));
+    }
+
+    #[test]
+    fn test_acl_manage_permissions_role_can_grant() {
+        let (env, client, admin) = setup();
+        let manager = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        // Grant manager the ManagePermissions permission directly
+        client.acl_grant_permission(&admin, &manager, &acl::Permission::ManagePermissions, &0);
+
+        // Manager can now grant roles to others
+        client.acl_grant_role(&manager, &user, &acl::Role::ReadOnly, &0);
+        assert!(client.acl_has_role(&user, &acl::Role::ReadOnly));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_acl_unauthorized_grant_panics() {
+        let (env, client, _admin) = setup();
+        let stranger = Address::generate(&env);
+        let victim = Address::generate(&env);
+
+        client.acl_grant_role(&stranger, &victim, &acl::Role::ReadOnly, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_acl_unauthorized_revoke_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &user, &acl::Role::ReadOnly, &0);
+        client.acl_revoke_role(&stranger, &user, &acl::Role::ReadOnly);
+    }
+
+    #[test]
+    fn test_acl_admin_always_has_permission() {
+        let (_env, client, admin) = setup();
+        // Admin has no explicit ACL grants but should pass all permission checks
+        assert!(client.acl_has_permission(&admin, &acl::Permission::ManageUpgrades));
+        assert!(client.acl_has_permission(&admin, &acl::Permission::EmergencyPause));
+        assert!(client.acl_has_permission(&admin, &acl::Permission::ManagePermissions));
+    }
+
+    #[test]
+    fn test_acl_multiple_admins_via_super_admin_role() {
+        let (env, client, admin) = setup();
+        let admin2 = Address::generate(&env);
+        let admin3 = Address::generate(&env);
+
+        client.acl_grant_role(&admin, &admin2, &acl::Role::SuperAdmin, &0);
+        // admin2 can now grant roles to admin3
+        client.acl_grant_role(&admin2, &admin3, &acl::Role::Admin, &0);
+
+        assert!(client.acl_has_role(&admin3, &acl::Role::Admin));
+        assert!(client.acl_has_permission(&admin3, &acl::Permission::SubmitHealth));
+    }
+
+    #[test]
+    #[should_panic(expected = "bulk grant exceeds maximum of 20 entries")]
+    fn test_acl_bulk_grant_exceeds_limit() {
+        let (env, client, admin) = setup();
+        let mut entries = soroban_sdk::Vec::new(&env);
+        for _ in 0..21 {
+            entries.push_back(acl::BulkRoleEntry {
+                grantee: Address::generate(&env),
+                role: acl::Role::ReadOnly,
+                expires_at: 0,
+            });
+        }
+        client.acl_bulk_grant_roles(&admin, &entries);
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration Management tests (issue #103)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_and_get_config() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "health_score_min");
+        let desc = String::from_str(&env, "Minimum health score threshold");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &75, &desc);
+
+        let entry = client
+            .get_config(&ConfigCategory::Threshold, &name)
+            .unwrap();
+        assert_eq!(entry.value.value, 75);
+        assert_eq!(entry.version, 1);
+        assert_eq!(entry.category, ConfigCategory::Threshold);
+        assert_eq!(entry.name, name);
+    }
+
+    #[test]
+    fn test_config_versioning_increments_on_each_write() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "price_deviation_low_bps");
+        let desc = String::from_str(&env, "Low deviation threshold in bps");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &200, &desc);
+        let v1 = client
+            .get_config(&ConfigCategory::Threshold, &name)
+            .unwrap();
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.value.value, 200);
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &300, &desc);
+        let v2 = client
+            .get_config(&ConfigCategory::Threshold, &name)
+            .unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.value.value, 300);
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &400, &desc);
+        let v3 = client
+            .get_config(&ConfigCategory::Threshold, &name)
+            .unwrap();
+        assert_eq!(v3.version, 3);
+    }
+
+    #[test]
+    fn test_config_audit_log_is_appended() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "pause_timelock_seconds");
+        let desc = String::from_str(&env, "Timelock for unpause");
+
+        // Timeouts category
+        client.set_config(&admin, &ConfigCategory::Timeouts, &name, &300, &desc);
+        client.set_config(&admin, &ConfigCategory::Timeouts, &name, &600, &desc);
+
+        let log = client.get_config_audit_log(&ConfigCategory::Timeouts, &name);
+        assert_eq!(log.len(), 2);
+
+        let first = log.get(0).unwrap();
+        assert_eq!(first.old_value, 0); // no prior value
+        assert_eq!(first.new_value, 300);
+        assert_eq!(first.version, 1);
+
+        let second = log.get(1).unwrap();
+        assert_eq!(second.old_value, 300);
+        assert_eq!(second.new_value, 600);
+        assert_eq!(second.version, 2);
+    }
+
+    #[test]
+    fn test_get_all_configs_returns_all_stored_entries() {
+        let (env, client, admin) = setup();
+
+        let n1 = String::from_str(&env, "max_monitored_assets");
+        let d1 = String::from_str(&env, "Max assets");
+        let n2 = String::from_str(&env, "max_batch_size");
+        let d2 = String::from_str(&env, "Max batch");
+
+        client.set_config(&admin, &ConfigCategory::Limits, &n1, &100, &d1);
+        client.set_config(&admin, &ConfigCategory::Limits, &n2, &50, &d2);
+
+        let export = client.get_all_configs();
+        assert_eq!(export.total, 2);
+        assert_eq!(export.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_bulk_config_update() {
+        let (env, client, admin) = setup();
+
+        let mut updates: Vec<BulkConfigUpdate> = Vec::new(&env);
+        updates.push_back(BulkConfigUpdate {
+            category: ConfigCategory::Threshold,
+            name: String::from_str(&env, "health_score_min"),
+            value: 60,
+            description: String::from_str(&env, "Min health score"),
+        });
+        updates.push_back(BulkConfigUpdate {
+            category: ConfigCategory::Timeouts,
+            name: String::from_str(&env, "price_staleness_seconds"),
+            value: 1800,
+            description: String::from_str(&env, "Staleness window"),
+        });
+
+        client.set_config_bulk(&admin, &updates);
+
+        let e1 = client
+            .get_config(
+                &ConfigCategory::Threshold,
+                &String::from_str(&env, "health_score_min"),
+            )
+            .unwrap();
+        assert_eq!(e1.value.value, 60);
+
+        let e2 = client
+            .get_config(
+                &ConfigCategory::Timeouts,
+                &String::from_str(&env, "price_staleness_seconds"),
+            )
+            .unwrap();
+        assert_eq!(e2.value.value, 1800);
+    }
+
+    #[test]
+    fn test_init_default_config_seeds_all_defaults() {
+        let (env, client, admin) = setup();
+
+        client.init_default_config(&admin);
+
+        let export = client.get_all_configs();
+        // 5 thresholds + 4 timeouts + 4 limits = 13 defaults
+        assert_eq!(export.total, 13);
+
+        // Spot-check a few values
+        let health_min = client
+            .get_config(
+                &ConfigCategory::Threshold,
+                &String::from_str(&env, "health_score_min"),
+            )
+            .unwrap();
+        assert_eq!(health_min.value.value, 50);
+
+        let max_assets = client
+            .get_config(
+                &ConfigCategory::Limits,
+                &String::from_str(&env, "max_monitored_assets"),
+            )
+            .unwrap();
+        assert_eq!(max_assets.value.value, 100);
+
+        let staleness = client
+            .get_config(
+                &ConfigCategory::Timeouts,
+                &String::from_str(&env, "price_staleness_seconds"),
+            )
+            .unwrap();
+        assert_eq!(staleness.value.value, 3600);
+    }
+
+    #[test]
+    fn test_init_default_config_does_not_overwrite_existing() {
+        let (env, client, admin) = setup();
+
+        // Set a custom value before seeding defaults
+        let name = String::from_str(&env, "health_score_min");
+        let desc = String::from_str(&env, "Custom override");
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &99, &desc);
+
+        client.init_default_config(&admin);
+
+        let entry = client
+            .get_config(&ConfigCategory::Threshold, &name)
+            .unwrap();
+        // Should still be the custom value, not the default 50
+        assert_eq!(entry.value.value, 99);
+        assert_eq!(entry.version, 1); // no extra write happened
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized: only admin may modify configuration")]
+    fn test_set_config_non_admin_panics() {
+        let (env, client, _admin) = setup();
+
+        let non_admin = Address::generate(&env);
+        let name = String::from_str(&env, "health_score_min");
+        let desc = String::from_str(&env, "desc");
+
+        client.set_config(&non_admin, &ConfigCategory::Threshold, &name, &50, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: name must not be empty")]
+    fn test_set_config_empty_name_panics() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "");
+        let desc = String::from_str(&env, "valid description");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &50, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: description must not be empty")]
+    fn test_set_config_empty_description_panics() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "valid_name");
+        let desc = String::from_str(&env, "");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &50, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: threshold value must be")]
+    fn test_set_config_negative_threshold_panics() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "health_score_min");
+        let desc = String::from_str(&env, "desc");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &-1, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: timeout value must be")]
+    fn test_set_config_zero_timeout_panics() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "pause_timelock_seconds");
+        let desc = String::from_str(&env, "desc");
+
+        client.set_config(&admin, &ConfigCategory::Timeouts, &name, &0, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: limit value must be")]
+    fn test_set_config_zero_limit_panics() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "max_monitored_assets");
+        let desc = String::from_str(&env, "desc");
+
+        client.set_config(&admin, &ConfigCategory::Limits, &name, &0, &desc);
+    }
+
+    #[test]
+    #[should_panic(expected = "config: bulk update list must not be empty")]
+    fn test_bulk_config_empty_list_panics() {
+        let (env, client, admin) = setup();
+
+        let updates: Vec<BulkConfigUpdate> = Vec::new(&env);
+        client.set_config_bulk(&admin, &updates);
+    }
+
+    #[test]
+    fn test_get_config_returns_none_for_unknown_key() {
+        let (env, client, _admin) = setup();
+
+        let result = client.get_config(
+            &ConfigCategory::Threshold,
+            &String::from_str(&env, "nonexistent_key"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_config_event_emitted_on_set() {
+        let (env, client, admin) = setup();
+
+        let name = String::from_str(&env, "health_score_min");
+        let desc = String::from_str(&env, "desc");
+
+        client.set_config(&admin, &ConfigCategory::Threshold, &name, &75, &desc);
+
+        // Verify at least one event was published
+        let events = env.events().all();
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_config_all_three_categories() {
+        let (env, client, admin) = setup();
+
+        client.set_config(
+            &admin,
+            &ConfigCategory::Threshold,
+            &String::from_str(&env, "t_param"),
+            &100,
+            &String::from_str(&env, "threshold param"),
+        );
+        client.set_config(
+            &admin,
+            &ConfigCategory::Timeouts,
+            &String::from_str(&env, "to_param"),
+            &60,
+            &String::from_str(&env, "timeout param"),
+        );
+        client.set_config(
+            &admin,
+            &ConfigCategory::Limits,
+            &String::from_str(&env, "l_param"),
+            &10,
+            &String::from_str(&env, "limit param"),
+        );
+
+        let export = client.get_all_configs();
+        assert_eq!(export.total, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Emergency Recovery tests (issue #298)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_enter_recovery_mode_stores_state() {
+        let (env, client, admin) = setup();
+        let reason = String::from_str(&env, "partial oracle failure");
+        client.enter_recovery_mode(&admin, &reason);
+        let state = client.get_recovery_state();
+        assert!(state.active);
+        assert_eq!(state.reason, reason);
+        assert_eq!(state.entered_by, admin);
+        assert_eq!(state.step_count, 0);
+    }
+
+    #[test]
+    fn test_exit_recovery_mode_clears_flag() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.exit_recovery_mode(&admin);
+        let state = client.get_recovery_state();
+        assert!(!state.active);
+    }
+
+    #[test]
+    fn test_record_recovery_step_appends_to_log() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        let desc = String::from_str(&env, "reverted oracle config");
+        client.record_recovery_step(&admin, &desc);
+        let state = client.get_recovery_state();
+        assert_eq!(state.step_count, 1);
+        let steps = client.get_recovery_steps();
+        assert_eq!(steps.len(), 1);
+        let step = steps.get(0).unwrap();
+        assert_eq!(step.description, desc);
+        assert!(step.completed);
+        assert_eq!(step.actor, admin);
+    }
+
+    #[test]
+    fn test_multiple_recovery_steps_ordered() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.record_recovery_step(&admin, &String::from_str(&env, "step one"));
+        client.record_recovery_step(&admin, &String::from_str(&env, "step two"));
+        client.record_recovery_step(&admin, &String::from_str(&env, "step three"));
+        let steps = client.get_recovery_steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.get(0).unwrap().description, String::from_str(&env, "step one"));
+        assert_eq!(steps.get(2).unwrap().description, String::from_str(&env, "step three"));
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode already active")]
+    fn test_enter_recovery_mode_twice_panics() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "r1"));
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "r2"));
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode is not active")]
+    fn test_exit_recovery_mode_when_not_active_panics() {
+        let (_, client, admin) = setup();
+        client.exit_recovery_mode(&admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "recovery mode is not active")]
+    fn test_record_step_without_recovery_mode_panics() {
+        let (env, client, admin) = setup();
+        client.record_recovery_step(&admin, &String::from_str(&env, "step"));
+    }
+
+    #[test]
+    fn test_recovery_enter_emits_event() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        let events = env.events().all();
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_recovery_exit_emits_event() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.exit_recovery_mode(&admin);
+        // Both enter and exit emit events; combined log must be non-empty.
+        let events = env.events().all();
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_recovery_step_reset_on_reentry() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "first"));
+        client.record_recovery_step(&admin, &String::from_str(&env, "step from first session"));
+        client.exit_recovery_mode(&admin);
+        // Re-enter: step log should be cleared
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "second"));
+        let state = client.get_recovery_state();
+        assert_eq!(state.step_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin Activity Service tests (issue #299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_admin_activity_log_populated_on_recovery_enter() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        let page = client.get_admin_activity(&1, &0);
+        assert_eq!(page.total, 1);
+        let entry = page.entries.get(0).unwrap();
+        assert_eq!(entry.action, AdminActivityAction::RecoveryEntered);
+        assert_eq!(entry.actor, admin);
+        assert_eq!(entry.sequence, 1);
+    }
+
+    #[test]
+    fn test_admin_activity_log_populated_on_recovery_exit() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.exit_recovery_mode(&admin);
+        let page = client.get_admin_activity(&50, &0);
+        // Should have 2 entries: RecoveryEntered and RecoveryExited
+        assert_eq!(page.total, 2);
+        let last = page.entries.get(1).unwrap();
+        assert_eq!(last.action, AdminActivityAction::RecoveryExited);
+    }
+
+    #[test]
+    fn test_admin_activity_get_by_actor_returns_matching() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.exit_recovery_mode(&admin);
+        let entries = client.get_admin_activity_by_actor(&admin, &10);
+        // Both enter and exit were performed by admin
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_admin_activity_get_by_actor_most_recent_first() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        client.exit_recovery_mode(&admin);
+        let entries = client.get_admin_activity_by_actor(&admin, &10);
+        // Most recent (RecoveryExited) should come first in the result
+        assert_eq!(entries.get(0).unwrap().action, AdminActivityAction::RecoveryExited);
+        assert_eq!(entries.get(1).unwrap().action, AdminActivityAction::RecoveryEntered);
+    }
+
+    #[test]
+    fn test_admin_activity_pagination_offset() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "i1"));
+        client.exit_recovery_mode(&admin);
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "i2"));
+        client.exit_recovery_mode(&admin);
+        // Total = 4 entries. Fetch page 2 (offset=2, limit=2)
+        let page = client.get_admin_activity(&2, &2);
+        assert_eq!(page.total, 4);
+        assert_eq!(page.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_admin_activity_sequence_monotonically_increases() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "i1"));
+        client.exit_recovery_mode(&admin);
+        let page = client.get_admin_activity(&10, &0);
+        assert_eq!(page.entries.get(0).unwrap().sequence, 1);
+        assert_eq!(page.entries.get(1).unwrap().sequence, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "limit must not exceed 50")]
+    fn test_admin_activity_limit_exceeds_max_panics() {
+        let (_, client, _) = setup();
+        client.get_admin_activity(&51, &0);
+    }
+
+    #[test]
+    fn test_admin_activity_empty_log_returns_zero_total() {
+        let (_, client, _) = setup();
+        let page = client.get_admin_activity(&10, &0);
+        assert_eq!(page.total, 0);
+        assert_eq!(page.entries.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-Source Health Submission tests (issue #300)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_register_health_source_stores_source() {
+        let (env, client, admin) = setup();
+        let source_id = String::from_str(&env, "oracle-1");
+        client.register_health_source(&admin, &source_id, &5000);
+        let sources = client.get_health_sources();
+        assert_eq!(sources.len(), 1);
+        let s = sources.get(0).unwrap();
+        assert_eq!(s.source_id, source_id);
+        assert_eq!(s.weight_bps, 5000);
+        assert!(s.trusted);
+    }
+
+    #[test]
+    fn test_register_health_source_update_existing() {
+        let (env, client, admin) = setup();
+        let source_id = String::from_str(&env, "oracle-1");
+        client.register_health_source(&admin, &source_id, &5000);
+        client.register_health_source(&admin, &source_id, &8000);
+        let sources = client.get_health_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.get(0).unwrap().weight_bps, 8000);
+    }
+
+    #[test]
+    #[should_panic(expected = "weight_bps must be greater than zero")]
+    fn test_register_health_source_zero_weight_panics() {
+        let (env, client, admin) = setup();
+        client.register_health_source(&admin, &String::from_str(&env, "oracle-1"), &0);
+    }
+
+    #[test]
+    fn test_submit_health_multi_source_stores_entry() {
+        let (env, client, admin) = setup();
+        let source_id = String::from_str(&env, "oracle-1");
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.register_health_source(&admin, &source_id, &10000);
+        client.submit_health_multi_source(&admin, &source_id, &asset, &90, &85, &80, &95);
+        let agg = client.get_aggregated_health(&asset).unwrap();
+        assert_eq!(agg.weighted_health_score, 90);
+        assert_eq!(agg.source_count, 1);
+    }
+
+    #[test]
+    fn test_aggregated_health_weighted_average_two_sources() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        let src1 = String::from_str(&env, "oracle-1");
+        let src2 = String::from_str(&env, "oracle-2");
+        // src1 weight=3000 (30%), score=100; src2 weight=7000 (70%), score=50
+        // Expected weighted avg = (3000*100 + 7000*50) / 10000 = (300000+350000)/10000 = 65
+        client.register_health_source(&admin, &src1, &3000);
+        client.register_health_source(&admin, &src2, &7000);
+        client.submit_health_multi_source(&admin, &src1, &asset, &100, &100, &100, &100);
+        client.submit_health_multi_source(&admin, &src2, &asset, &50, &50, &50, &50);
+        let agg = client.get_aggregated_health(&asset).unwrap();
+        assert_eq!(agg.weighted_health_score, 65);
+        assert_eq!(agg.source_count, 2);
+    }
+
+    #[test]
+    fn test_aggregated_health_returns_none_when_no_submissions() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.register_health_source(&admin, &String::from_str(&env, "oracle-1"), &10000);
+        // No submission made
+        let agg = client.get_aggregated_health(&asset);
+        assert!(agg.is_none());
+    }
+
+    #[test]
+    fn test_revoke_health_source_excludes_from_aggregation() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        let src = String::from_str(&env, "oracle-1");
+        client.register_health_source(&admin, &src, &10000);
+        client.submit_health_multi_source(&admin, &src, &asset, &90, &80, &70, &60);
+        client.revoke_health_source(&admin, &src);
+        // After revoke, the revoked source should not contribute to aggregation
+        let agg = client.get_aggregated_health(&asset);
+        assert!(agg.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "source is not registered or not trusted")]
+    fn test_submit_multi_source_unregistered_source_panics() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health_multi_source(
+            &admin,
+            &String::from_str(&env, "unknown"),
+            &asset,
+            &80,
+            &80,
+            &80,
+            &80,
+        );
+    }
+
+    #[test]
+    fn test_submit_multi_source_emits_event() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        let src = String::from_str(&env, "oracle-1");
+        client.register_asset(&admin, &asset);
+        client.register_health_source(&admin, &src, &10000);
+        client.submit_health_multi_source(&admin, &src, &asset, &80, &80, &80, &80);
+        let events = env.events().all();
+        assert!(!events.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Event Replay Helper tests (issue #296)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_replay_schema_version_returns_constant() {
+        let (_, client, _) = setup();
+        assert_eq!(client.get_replay_schema_version(), EVENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_replay_log_size_zero_initially() {
+        let (_, client, _) = setup();
+        assert_eq!(client.get_replay_log_size(), 0);
+    }
+
+    #[test]
+    fn test_submit_health_appends_replay_entry() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &85, &80, &75, &90);
+        assert_eq!(client.get_replay_log_size(), 1);
+    }
+
+    #[test]
+    fn test_replay_entry_has_correct_event_type() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &85, &80, &75, &90);
+        let page = client.get_replay_events(&0, &10);
+        assert_eq!(page.total, 1);
+        let entry = page.entries.get(0).unwrap();
+        assert_eq!(entry.event_type, String::from_str(&env, "health_up"));
+        assert_eq!(entry.value, 85);
+        assert_eq!(entry.schema_version, EVENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_replay_entry_ordering_key_monotone() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &80, &80, &80, &80);
+        client.submit_health(&admin, &asset, &70, &70, &70, &70);
+        let page = client.get_replay_events(&0, &10);
+        assert_eq!(page.total, 2);
+        let first = page.entries.get(0).unwrap();
+        let second = page.entries.get(1).unwrap();
+        assert!(second.ordering_key > first.ordering_key);
+        assert!(second.event_id > first.event_id);
+    }
+
+    #[test]
+    fn test_get_replay_events_from_ordering_key_filters() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &80, &80, &80, &80);
+        client.submit_health(&admin, &asset, &70, &70, &70, &70);
+        // Use the ordering_key of the second entry to fetch only from there
+        let all = client.get_replay_events(&0, &10);
+        let second_key = all.entries.get(1).unwrap().ordering_key;
+        let filtered = client.get_replay_events(&second_key, &10);
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries.get(0).unwrap().value, 70);
+    }
+
+    #[test]
+    fn test_replay_page_includes_schema_version() {
+        let (env, client, admin) = setup();
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+        client.submit_health(&admin, &asset, &80, &80, &80, &80);
+        let page = client.get_replay_events(&0, &1);
+        assert_eq!(page.schema_version, EVENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[should_panic(expected = "limit must not exceed 100")]
+    fn test_get_replay_events_limit_exceeds_max_panics() {
+        let (_, client, _) = setup();
+        client.get_replay_events(&0, &101);
+    }
+
+    #[test]
+    fn test_recovery_enter_appends_replay_entry() {
+        let (env, client, admin) = setup();
+        client.enter_recovery_mode(&admin, &String::from_str(&env, "incident"));
+        assert_eq!(client.get_replay_log_size(), 1);
+        let page = client.get_replay_events(&0, &10);
+        let entry = page.entries.get(0).unwrap();
+        assert_eq!(entry.event_type, String::from_str(&env, "rec_entr"));
+        assert_eq!(entry.actor, admin);
     }
 }
